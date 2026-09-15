@@ -40,6 +40,19 @@ export function getFfmpegVersion(): string | null {
   return _ffmpegVersion;
 }
 
+/** True when this ffmpeg build can encode H.264 (preferred) — else mpeg4 fallback. Cached. */
+let _hasLibx264: boolean | null = null;
+export function hasLibx264(): boolean {
+  if (_hasLibx264 !== null) return _hasLibx264;
+  try {
+    const out = execSync(`"${getFfmpegBinary()}" -hide_banner -encoders`, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    _hasLibx264 = /(^|\s)libx264(\s|$)/m.test(out);
+  } catch {
+    _hasLibx264 = false;
+  }
+  return _hasLibx264;
+}
+
 export interface MediaProbe {
   hasVideo: boolean;
   hasAudio: boolean;
@@ -121,67 +134,120 @@ function runFfmpeg(args: string[], timeoutMs: number): Promise<void> {
 /**
  * Normalize a Pinterest MP4 for maximum player compatibility.
  *
- * Root cause of the "black screen" reports: Pinterest's MP4s (AWS Elemental
+ * Why a FULL re-encode and not a remux: Pinterest's MP4s (AWS Elemental
  * encodes) carry an `elst` edit list that strict players (Telegram's in-app
- * player, iOS AVPlayer, some Android players) honor as blank/held frames,
- * while desktop players ignore it — so the file looks fine locally but plays
- * black in Telegram. A stream-copy remux preserves the edit list, which is
- * why copying alone didn't fix it.
+ * player, iOS AVPlayer, some Android players) honor as blank/held frames —
+ * black picture with working audio — while desktop players ignore the edit
+ * list and play fine. A stream-copy remux preserves the edit list, so it
+ * cannot fix this; only re-encoding (which rebuilds every timestamp from
+ * decoded frames) plus `-use_editlist 0` guarantees a clean file. It also
+ * fixes any other source weirdness in one stroke: HEVC/VP9/AV1 video (black
+ * on phones that lack the decoder), odd pixel formats, negative CTS offsets,
+ * odd dimensions, HE-AAC audio quirks.
  *
- * - Typical case (H.264 + yuv420p, which is nearly all Pinterest output):
- *   fast stream-copy with `-ignore_editlist` (drops the edit list), rebuilt
- *   timestamps and moov-first. No re-encode, takes ~1s.
- * - Exotic case (HEVC/VP9/odd pixel format): full transcode to baseline
- *   H.264 + yuv420p + AAC so every phone can decode it.
+ * Output is always baseline-compatible: H.264 + yuv420p + AAC-LC (or mpeg4
+ * when the build has no libx264), even dimensions, moov first.
  *
- * Never throws — returns the original result on any failure (missing ffmpeg
- * or missing libx264 included).
+ * Chain (never throws — returns the original result when everything fails):
+ *   1. transcode → decode-verify → probe check → accept
+ *   2. fast remux fallback (edit-list strip, no re-encode) → same checks
+ *   3. original file
  */
 export async function normalizePinterestMp4(result: DownloadResult): Promise<DownloadResult> {
   if (getFfmpegVersion() === null) return result;
   const probe = probeMedia(result.filePath);
-  const needsTranscode = !probe || !probe.hasVideo ||
-    probe.videoCodec !== "h264" ||
-    !(probe.pixFmt === "yuv420p" || probe.pixFmt === "yuvj420p");
+  const inDesc = probe && probe.hasVideo
+    ? `${probe.videoCodec || "?"}${probe.pixFmt ? `/${probe.pixFmt}` : ""}${probe.hasAudio ? `+${probe.audioCodec || "?"}` : ""}`
+    : "unprobed";
   const fixedPath = result.filePath.replace(/\.mp4$/i, "") + "_norm.mp4";
-  const args = needsTranscode
-    ? [
+  const durationSec = probe && probe.durationSec > 0 ? probe.durationSec : 60;
+  // Generous but bounded: ~15s of CPU per second of video, 2–10 min window.
+  const timeoutMs = Math.min(600000, Math.max(120000, Math.ceil(durationSec * 15000)));
+
+  const accept = (label: string): DownloadResult | null => {
+    try {
+      const stat = fs.statSync(fixedPath);
+      if (stat.size === 0) return null;
+      const check = probeMedia(fixedPath);
+      if (!check || !check.hasVideo) return null;
+      if (!decodeVerifies(fixedPath)) return null;
+      try { fs.unlinkSync(result.filePath); } catch {}
+      console.log(`📌 Pinterest MP4 normalized (${label}, ${inDesc} → h264/yuv420p+aac): ${path.basename(fixedPath)} (${(stat.size / 1048576).toFixed(1)} MB)`);
+      return { ...result, filePath: fixedPath, fileName: path.basename(fixedPath), size: stat.size };
+    } catch {
+      return null;
+    }
+  };
+  const cleanup = (): void => {
+    try { if (fs.existsSync(fixedPath)) fs.unlinkSync(fixedPath); } catch {}
+  };
+
+  // --- 1) Full transcode (the actual black-screen fix) ----------------------
+  const videoArgs = hasLibx264()
+    ? ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p"]
+    : ["-c:v", "mpeg4", "-q:v", "4", "-pix_fmt", "yuv420p"];
+  try {
+    await runFfmpeg(
+      [
         "-y", "-v", "error",
         "-ignore_editlist", "1",
         "-i", result.filePath,
-        "-map", "0",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-        "-pix_fmt", "yuv420p",
-        ...(probe?.hasAudio ? ["-c:a", "aac", "-b:a", "128k"] : ["-an"]),
-        "-movflags", "+faststart",
+        "-map", "0:v:0", "-map", "0:a?",
+        "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+        ...videoArgs,
+        ...(probe?.hasAudio === false ? ["-an"] : ["-c:a", "aac", "-b:a", "128k"]),
+        "-use_editlist", "0",
+        "-movflags", "+faststart+negative_cts_offsets",
         fixedPath,
-      ]
-    : [
+      ],
+      timeoutMs
+    );
+    const done = accept(hasLibx264() ? "re-encoded H.264" : "re-encoded mpeg4");
+    if (done) return done;
+    console.warn("⚠️ Pinterest transcode output failed verification, trying fast remux…");
+  } catch (err: any) {
+    console.warn(`⚠️ Pinterest transcode failed (${(err?.message || String(err)).slice(0, 100)}), trying fast remux…`);
+  }
+  cleanup();
+
+  // --- 2) Fast remux fallback (edit-list strip, no re-encode) ---------------
+  try {
+    await runFfmpeg(
+      [
         "-y", "-v", "error",
         "-ignore_editlist", "1",
         "-fflags", "+genpts",
         "-i", result.filePath,
-        "-c", "copy", "-map", "0",
-        // -use_editlist 0 is what actually drops the elst box on copy
-        // (input-side -ignore_editlist alone still remuxes it); +faststart
-        // puts moov first and +negative_cts_offsets keeps B-frame CTS
-        // valid for strict players.
+        "-c", "copy", "-map", "0:v:0", "-map", "0:a?",
         "-use_editlist", "0",
         "-movflags", "+faststart+negative_cts_offsets",
         fixedPath,
-      ];
-  try {
-    await runFfmpeg(args, 600000);
-    const stat = fs.statSync(fixedPath);
-    if (stat.size === 0) throw new Error("empty remux output");
-    const check = probeMedia(fixedPath);
-    if (!check || !check.hasVideo) throw new Error("normalized file has no video track");
-    try { fs.unlinkSync(result.filePath); } catch {}
-    console.log(`📌 Pinterest MP4 normalized for playback (${needsTranscode ? "re-encoded H.264" : "edit-list stripped"}): ${path.basename(fixedPath)} (${(stat.size / 1048576).toFixed(1)} MB)`);
-    return { ...result, filePath: fixedPath, fileName: path.basename(fixedPath), size: stat.size };
+      ],
+      120000
+    );
+    const done = accept("edit-list stripped");
+    if (done) return done;
   } catch (err: any) {
-    try { if (fs.existsSync(fixedPath)) fs.unlinkSync(fixedPath); } catch {}
-    console.warn(`⚠️ Pinterest normalize skipped, sending original: ${(err?.message || String(err)).slice(0, 130)}`);
-    return result;
+    console.warn(`⚠️ Pinterest remux failed: ${(err?.message || String(err)).slice(0, 100)}`);
+  }
+  cleanup();
+
+  // --- 3) Give up gracefully: send the original ------------------------------
+  console.warn("⚠️ Pinterest normalize skipped, sending original.");
+  return result;
+}
+
+/**
+ * Full decode test: catches truncated/corrupt files that still probe OK
+ * (probe only reads headers). Returns true when every frame decodes cleanly.
+ */
+function decodeVerifies(filePath: string): boolean {
+  try {
+    const r = spawnSync(getFfmpegBinary(), ["-v", "error", "-i", filePath, "-f", "null", "-"], { encoding: "utf8" });
+    if (r.error) return false;
+    // Any decode error/warning on stderr means a damaged stream.
+    return String(r.stderr || "").trim().length === 0;
+  } catch {
+    return false;
   }
 }

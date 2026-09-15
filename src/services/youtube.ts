@@ -3,7 +3,7 @@ import { downloadViaCobalt, isCobaltConfigured } from "./cobalt";
 import { downloadYouTubeViaInvidious, extractYouTubeId } from "./invidious";
 import { downloadYouTubeViaPiped, getLastPipedSummary } from "./piped";
 import { downloadYouTubeViaAndroid } from "./android";
-import { downloadYouTubeViaYtDlp, getLastYtDlpSummary, ytDlpFallbackStatus } from "./youtubeYtdlp";
+import { downloadYouTubeViaYtDlp, getLastYtDlpSummary, hasUsableCookies, ytDlpFallbackStatus } from "./youtubeYtdlp";
 import type { DownloadProgress, DownloadResult } from "./downloader";
 
 /**
@@ -166,12 +166,18 @@ function buildYouTubeError(androidWalled = false, ytdlpWalled = false): Error {
     if (s.botWalled > 0) routes.push(`${s.botWalled} of ${s.tried} public server(s)`);
     if (androidWalled || ytdlpWalled) routes.push("this bot's own server");
     const where = routes.length > 0 ? `on ${routes.join(" and ")}` : "right now";
+    // When the bot has no login cookies at all, say so plainly: walled +
+    // cookieless means age-gated/rate-limited videos have no remaining route.
+    const cookieHint = hasUsableCookies()
+      ? ""
+      : "\n\n🔑 Note: this bot has NO login cookies installed, so age-restricted or rate-limited videos can't work — the admin can send a fresh logged-in cookies.txt to the bot (applies instantly).";
     return new Error(
       `❌ YouTube bot-blocked this video ${where} right now (its anti-bot wall is per-video and temporary).\n\n` +
         "Please try again in a few minutes — a different server usually answers on retry — " +
         "or try a different public video.\n\n" +
         "🔧 Admin: for reliable downloads, self-host Cobalt (ghcr.io/imputnet/cobalt) and set COBALT_API_URL." +
-        ytdlpHint
+        ytdlpHint +
+        cookieHint
     );
   }
   return new Error(

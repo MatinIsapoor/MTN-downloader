@@ -19,14 +19,15 @@ import type { DownloadProgress, DownloadResult } from "./downloader";
  *   Videos that are unwinnable for plain-HTTPS pipelines regularly still
  *   download here — and vice versa. That independence is the point.
  *
- * Order inside this method: anonymous player clients first
- * (android → ios → mweb → web_safari → tv → default), then cookie-attached
- * attempts (when cookies exist and YOUTUBE_COOKIE_MODE allows them), so most
- * public videos download without ever touching the login session. web_safari
- * talks to YouTube's embed player API, which is far less guarded than the
- * watch-page player and routinely serves progressive MP4s with no login even
- * when the default clients are bot-walled for the same video from the same
- * IP. (web_embedded/tv_embedded are deliberately NOT listed: web_embedded
+ * Order inside this method: anonymous client stacks first
+ * (mobile [android,ios,mweb] → embed [web_safari,tv] → yt-dlp defaults →
+ * mobile again over IPv6 when available), then cookie-attached attempts
+ * (when cookies exist and YOUTUBE_COOKIE_MODE allows them), so most
+ * public videos download without ever touching the login session. The embed
+ * stack talks to YouTube's embed/safari player API, which is far less
+ * guarded than the watch-page player; the IPv6 stack is a genuinely
+ * different egress IP that is often clean while the IPv4 is flagged.
+ * (web_embedded/tv_embedded are deliberately NOT listed: web_embedded
  * answers error 152 for ordinary videos and tv_embedded isn't a valid
  * player_client in current yt-dlp — both just burn rotation time.)
  * Disable with YOUTUBE_YTDLP_FALLBACK=false.
@@ -120,7 +121,7 @@ export function ytDlpFallbackStatus(): "ready" | "disabled" | "missing" {
 }
 
 /** Any cookie source configured (browser / env / usable file)? */
-function hasUsableCookies(): boolean {
+export function hasUsableCookies(): boolean {
   if (config.cookiesFromBrowser) return true;
   if (config.cookiesContent) return true;
   try {
@@ -131,9 +132,43 @@ function hasUsableCookies(): boolean {
   }
 }
 
-/** Format selector: mobile clients get itag-18 progressive (no merge); default is height-capped. */
-function formatFor(playerClient: string | null): string {
-  if (playerClient === "android" || playerClient === "ios" || playerClient === "mweb") {
+/**
+ * Best-effort YouTube visitor data (fixes "PO Token … Missing required
+ * Visitor Data" for web clients). Fetched from our own IP from the YouTube
+ * homepage; cached 1h. Null when unreachable — callers simply omit it.
+ */
+let _visitorData: { at: number; value: string | null } | null = null;
+async function fetchVisitorData(): Promise<string | null> {
+  const now = Date.now();
+  if (_visitorData && now - _visitorData.at < 3600 * 1000) return _visitorData.value;
+  let value: string | null = null;
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+    try {
+      const res = await fetch("https://www.youtube.com/", {
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+          "Accept-Language": "en-US,en;q=0.9",
+        },
+        signal: controller.signal,
+      });
+      if (res.ok) {
+        const html = await res.text();
+        value = html.match(/"visitorData"\s*:\s*"([^"]+)"/)?.[1] || null;
+      }
+    } finally {
+      clearTimeout(timeout);
+    }
+  } catch {}
+  _visitorData = { at: now, value };
+  return value;
+}
+
+/** Format selector: mobile stacks get itag-18 progressive (no merge); rest is height-capped. */
+function formatFor(mobile: boolean): string {
+  if (mobile) {
     return "18/b[ext=mp4]/b";
   }
   const h = config.youtubeMaxHeight;
@@ -145,34 +180,53 @@ function formatFor(playerClient: string | null): string {
 
 interface AttemptSpec {
   name: string;
-  playerClient: string | null;
+  /** Ordered client list (yt-dlp falls through internally); null = yt-dlp defaults. */
+  playerClients: string[] | null;
   useCookies: boolean;
+  /** false = omit --force-ipv4 so the OS may route via IPv6 (a different, often clean, egress). */
+  ipv4: boolean;
+  mobile: boolean;
 }
 
-/** Per-client rotation. Anonymous first (auto), cookies first (cookies), anon only (never). */
+/**
+ * Per-stack rotation. Each attempt hands yt-dlp an ORDERED client list so
+ * one process covers several per-(video, IP, client) lottery draws (with a
+ * shared JS-challenge cache) instead of spawning a process per client.
+ * Anonymous first (auto), cookies first (cookies), anon only (never).
+ */
 function attemptsForYouTube(): AttemptSpec[] {
+  const v4 = config.ytDlpForceIpv4;
   const anon: AttemptSpec[] = [
-    { name: "android", playerClient: "android", useCookies: false },
-    { name: "ios", playerClient: "ios", useCookies: false },
-    { name: "mweb", playerClient: "mweb", useCookies: false },
-    // web_safari: YouTube guards the embed/safari player far less than the
-    // watch page — it often wins on IPs where every default client is
-    // "Sign in to confirm you're not a bot"-walled, with no login needed.
-    { name: "web_safari", playerClient: "web_safari", useCookies: false },
-    { name: "tv", playerClient: "tv", useCookies: false },
-    { name: "default", playerClient: null, useCookies: false },
+    { name: "mobile", playerClients: ["android", "ios", "mweb"], useCookies: false, ipv4: v4, mobile: true },
+    // web_safari/tv talk to the embed/safari player, which YouTube guards
+    // far less than the watch page — they often win on IPs where every
+    // default client is "Sign in to confirm you're not a bot"-walled.
+    { name: "embed", playerClients: ["web_safari", "tv"], useCookies: false, ipv4: v4, mobile: false },
+    { name: "default", playerClients: null, useCookies: false, ipv4: v4, mobile: false },
   ];
+  // Same mobile stack without --force-ipv4: when the host has IPv6, this is
+  // a genuinely different egress IP that is often NOT flagged while the
+  // IPv4 is. Fails fast where there is no IPv6 route.
+  if (v4) {
+    anon.push({ name: "mobile-v6", playerClients: ["android", "ios", "mweb"], useCookies: false, ipv4: false, mobile: true });
+  }
   const mode = config.youtubeCookieMode;
   if (mode === "never" || !hasUsableCookies()) return anon;
   const withCookies: AttemptSpec[] = [
-    { name: "android+cookies", playerClient: "android", useCookies: true },
-    { name: "default+cookies", playerClient: null, useCookies: true },
+    { name: "mobile+cookies", playerClients: ["android", "ios", "mweb"], useCookies: true, ipv4: v4, mobile: true },
+    { name: "default+cookies", playerClients: null, useCookies: true, ipv4: v4, mobile: false },
   ];
   return mode === "cookies" ? [...withCookies, ...anon] : [...anon, ...withCookies];
 }
 
 /** Extra yt-dlp args for one YouTube attempt. */
-function buildYoutubeArgs(playerClient: string | null, format: string, useCookies: boolean): string[] {
+function buildYoutubeArgs(
+  playerClients: string[] | null,
+  format: string,
+  useCookies: boolean,
+  ipv4: boolean,
+  visitorData: string | null
+): string[] {
   const args: string[] = [];
   if (useCookies) {
     if (config.cookiesFromBrowser) {
@@ -185,11 +239,12 @@ function buildYoutubeArgs(playerClient: string | null, format: string, useCookie
   }
   // Combine youtube extractor keys into ONE --extractor-args (semicolon-separated).
   const ytKeys: string[] = [];
-  if (playerClient) ytKeys.push(`player_client=${playerClient}`);
+  if (playerClients) ytKeys.push(`player_client=${playerClients.join(",")}`);
   if (config.youtubePlayerSkip) ytKeys.push("player_skip=webpage,configs");
+  if (visitorData) ytKeys.push(`visitor_data=${visitorData}`);
   if (ytKeys.length > 0) args.push("--extractor-args", `youtube:${ytKeys.join(";")}`);
   if (config.ytDlpProxy) args.push("--proxy", config.ytDlpProxy);
-  if (config.ytDlpForceIpv4) args.push("--force-ipv4");
+  if (ipv4) args.push("--force-ipv4");
   if (config.potServerUrl) {
     args.push("--extractor-args", `youtubepot-bgutilhttp:base_url=${config.potServerUrl}`);
   }
@@ -341,17 +396,20 @@ export async function downloadYouTubeViaYtDlp(
 
   const attempts = attemptsForYouTube();
   const summary: YtDlpSummary = { tried: 0, walled: 0 };
+  // Visitor data (for web clients' PO-token checks) is fetched once per
+  // rotation, best-effort — null on walled/offline networks, which is fine.
+  const visitorData = await fetchVisitorData();
   let lastError = "";
   for (const attempt of attempts) {
     summary.tried++;
     const args = [
       ...baseArgs,
-      ...buildYoutubeArgs(attempt.playerClient, formatFor(attempt.playerClient), attempt.useCookies),
+      ...buildYoutubeArgs(attempt.playerClients, formatFor(attempt.mobile), attempt.useCookies, attempt.ipv4, visitorData),
       "--print", "after_move:filepath",
       url,
     ];
     try {
-      console.log(`⏳ YouTube yt-dlp attempt: ${attempt.name}${attempt.useCookies ? " (cookies)" : " (anonymous)"}…`);
+      console.log(`⏳ YouTube yt-dlp attempt: ${attempt.name}${attempt.useCookies ? " (cookies)" : " (anonymous)"}${attempt.ipv4 ? "" : " (IPv6 route)"}…`);
       const stdout = await runYtDlpAttempt(args, onProgress);
       const result = resolveDownloadedFile(stdout, id);
       _lastSummary = summary;

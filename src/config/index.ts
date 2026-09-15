@@ -145,7 +145,8 @@ export const config = {
   cobaltApiKey: (process.env.COBALT_API_KEY || "").trim(),
   // --- yt-dlp hardening (YouTube datacenter bot-checks) --------------------
   // Final YouTube fallback: local yt-dlp with per-client rotation
-  // (android → ios → mweb → tv → default, anonymous first then cookies).
+  // (mobile [android,ios,mweb] → embed [web_safari,tv] → defaults → IPv6
+  // retry, anonymous first then cookies).
   // This is a genuinely different method from the HTTPS pipelines above —
   // it solves JS challenges, deciphers signatures, and can use cookies —
   // so it often succeeds where Piped/Invidious/youtubei are all walled.

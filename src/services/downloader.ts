@@ -7,7 +7,7 @@ import { detectPlatform } from "../utils/platform";
 import { downloadViaCobalt, isCobaltConfigured } from "./cobalt";
 import { downloadYouTubeCookieFree } from "./youtube";
 import { downloadPinterest } from "./pinterest";
-import { getFfmpegBinary, getFfmpegVersion, normalizePinterestMp4 } from "./media";
+import { getFfmpegBinary, getFfmpegVersion, hasLibx264, normalizePinterestMp4 } from "./media";
 
 export interface DownloadResult {
   filePath: string;
@@ -410,8 +410,8 @@ export function logDownloaderDiagnostics(): void {
   );
   console.log(
     getFfmpegVersion()
-      ? `🔧 ffmpeg: available (${getFfmpegVersion()}, HLS merge enabled)`
-      : "⚠️ ffmpeg: NOT FOUND — HLS-only Pinterest videos will fall back to cover images (build.sh installs a static build on Linux)"
+      ? `🔧 ffmpeg: available (${getFfmpegVersion()}, H.264 encoder: ${hasLibx264() ? "libx264" : "mpeg4-fallback"})`
+      : "⚠️ ffmpeg: NOT FOUND — HLS-only Pinterest videos will fall back to cover images and Pinterest MP4s ship un-normalized (build.sh installs a static build on Linux)"
   );
   if (config.ytDlpProxy) console.log("🔧 Proxy: YT_DLP_PROXY is set (YouTube traffic routed via proxy)");
   else if (process.env.RENDER_EXTERNAL_URL || process.env.RENDER)
