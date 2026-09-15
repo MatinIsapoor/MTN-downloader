@@ -2,6 +2,7 @@ import * as fs from "fs";
 import * as path from "path";
 import * as crypto from "crypto";
 import { config } from "../config";
+import { probeMedia } from "./media";
 import type { DownloadProgress, DownloadResult } from "./downloader";
 
 const UA =
@@ -143,7 +144,13 @@ function collectMp4Candidates(data: any): PinMp4Candidate[] {
   return out.filter((e) => (seen.has(e.url) ? false : (seen.add(e.url), true)));
 }
 
-/** Prefer Pinterest's canonical 720p progressive rendition, else largest frame. */
+/**
+ * Prefer Pinterest's canonical 720p progressive rendition, else the best
+ * full-file rendition. Story pins list experimental transcodes
+ * (…_t1.mp4 … _t4.mp4) alongside the full file (…/720p/….mp4) — the _tN
+ * variants are lower-bitrate ladder copies, so they rank below any
+ * full-file URL even when the API dimensions tie.
+ */
 function pickBestMp4(candidates: PinMp4Candidate[]): string | null {
   if (candidates.length === 0) return null;
   const score = (e: PinMp4Candidate): number => {
@@ -151,6 +158,9 @@ function pickBestMp4(candidates: PinMp4Candidate[]): string | null {
     let s = (e.width || 0) * (e.height || 0);
     if (id === "V_720P") s += 1e12;
     else if (/720|1080/.test(id)) s += 1e11;
+    if (/\/720p\//i.test(e.url)) s += 5e10;
+    else if (/\/1080p\//i.test(e.url)) s += 4e10;
+    if (/_t\d+\.mp4(\?|#|$)/i.test(e.url)) s -= 1e11;
     return s;
   };
   return [...candidates].sort((a, b) => score(b) - score(a))[0].url;
@@ -326,6 +336,16 @@ export async function downloadPinterest(
     if (stat.size === 0) {
       try { fs.unlinkSync(filePath); } catch {}
       throw new Error("❌ Pinterest returned an empty file. Try another pin.");
+    }
+    // The CDN sometimes answers with a playlist/error page saved as .mp4 —
+    // sending that to Telegram plays as a black/unplayable video. Verify a
+    // real video track exists; otherwise fall through to yt-dlp (caller
+    // continues the video pipeline on plain errors) instead of shipping
+    // a guaranteed-black file.
+    const probe = probeMedia(filePath);
+    if (probe && !probe.hasVideo) {
+      try { fs.unlinkSync(filePath); } catch {}
+      throw new Error("Pinterest CDN returned a non-video file — needs yt-dlp fallback");
     }
     console.log(`✅ Pinterest saved: ${fileName} (${(stat.size / 1048576).toFixed(1)} MB)`);
     return { filePath, fileName, title: base, ext: "mp4", size: stat.size, platform: "pinterest" };

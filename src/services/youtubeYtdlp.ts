@@ -20,9 +20,15 @@ import type { DownloadProgress, DownloadResult } from "./downloader";
  *   download here — and vice versa. That independence is the point.
  *
  * Order inside this method: anonymous player clients first
- * (android → ios → mweb → tv → default), then cookie-attached attempts
- * (when cookies exist and YOUTUBE_COOKIE_MODE allows them), so most
- * public videos download without ever touching the login session.
+ * (android → ios → mweb → web_safari → tv → default), then cookie-attached
+ * attempts (when cookies exist and YOUTUBE_COOKIE_MODE allows them), so most
+ * public videos download without ever touching the login session. web_safari
+ * talks to YouTube's embed player API, which is far less guarded than the
+ * watch-page player and routinely serves progressive MP4s with no login even
+ * when the default clients are bot-walled for the same video from the same
+ * IP. (web_embedded/tv_embedded are deliberately NOT listed: web_embedded
+ * answers error 152 for ordinary videos and tv_embedded isn't a valid
+ * player_client in current yt-dlp — both just burn rotation time.)
  * Disable with YOUTUBE_YTDLP_FALLBACK=false.
  *
  * Returns the downloaded file on success, null when every attempt fails
@@ -149,6 +155,10 @@ function attemptsForYouTube(): AttemptSpec[] {
     { name: "android", playerClient: "android", useCookies: false },
     { name: "ios", playerClient: "ios", useCookies: false },
     { name: "mweb", playerClient: "mweb", useCookies: false },
+    // web_safari: YouTube guards the embed/safari player far less than the
+    // watch page — it often wins on IPs where every default client is
+    // "Sign in to confirm you're not a bot"-walled, with no login needed.
+    { name: "web_safari", playerClient: "web_safari", useCookies: false },
     { name: "tv", playerClient: "tv", useCookies: false },
     { name: "default", playerClient: null, useCookies: false },
   ];
@@ -206,14 +216,19 @@ function buildYoutubeArgs(playerClient: string | null, format: string, useCookie
 }
 
 function isFatalError(msg: string): boolean {
+  // NOTE: "Requested format is not available" is DELIBERATELY not fatal
+  // here (unlike the single-attempt platforms): it only means THIS client
+  // has no matching format for the video (SABR-only response, n-challenge
+  // without a JS runtime, embed-restricted rendition…) — the next client in
+  // the rotation usually does. Aborting on it turned one client's format gap
+  // into a bogus "Video unavailable or private" for the whole video.
   return (
     msg.includes("Unsupported URL") ||
     msg.includes("Video unavailable") ||
     msg.includes("Private video") ||
     msg.includes("This video is private") ||
     msg.includes("max-filesize") ||
-    msg.includes("File is larger than") ||
-    msg.includes("Requested format is not available")
+    msg.includes("File is larger than")
   );
 }
 

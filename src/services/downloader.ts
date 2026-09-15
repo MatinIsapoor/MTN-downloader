@@ -7,6 +7,7 @@ import { detectPlatform } from "../utils/platform";
 import { downloadViaCobalt, isCobaltConfigured } from "./cobalt";
 import { downloadYouTubeCookieFree } from "./youtube";
 import { downloadPinterest } from "./pinterest";
+import { getFfmpegBinary, getFfmpegVersion, normalizePinterestMp4 } from "./media";
 
 export interface DownloadResult {
   filePath: string;
@@ -71,34 +72,66 @@ export function ytDlpAgeDays(): number | null {
 }
 
 /**
- * Best-effort `yt-dlp -U` self-update on boot. Only runs when
+ * Best-effort yt-dlp self-update on boot. Only runs when
  * YTDLP_AUTO_UPDATE=true. Never throws — a failed update just logs.
+ *
+ * Two install flavors exist: binary builds (yt-dlp.exe / linux zip) update
+ * via `yt-dlp -U`, but pip installs (what build.sh uses on Render) REFUSE
+ * self-update ("installed with pip… use pip to update") — without the pip
+ * path below, the server binary would rot in place and YouTube/Pinterest
+ * would break on their own within weeks as extractors go stale.
  */
 export async function maybeAutoUpdateYtDlp(): Promise<void> {
   if (!config.ytdlpAutoUpdate) return;
   try {
     console.log("🔄 YTDLP_AUTO_UPDATE=true — attempting yt-dlp self-update…");
-    const { spawn: spawnProc } = await import("child_process");
-    await new Promise<void>((resolve) => {
-      const proc = spawnProc(config.ytDlpPath, ["-U"], { shell: false });
-      let out = "";
-      proc.stdout?.on("data", (d: Buffer) => { out += d.toString(); });
-      proc.stderr?.on("data", (d: Buffer) => { out += d.toString(); });
-      const timer = setTimeout(() => { try { proc.kill(); } catch {} resolve(); }, 120000);
-      proc.on("close", (code) => {
-        clearTimeout(timer);
-        console.log(`🔄 yt-dlp -U exited (${code}): ${out.slice(-300).trim() || "no output"}`);
-        resolve();
-      });
-      proc.on("error", (err) => {
-        clearTimeout(timer);
-        console.warn(`⚠️ yt-dlp self-update failed: ${err.message.slice(0, 120)}`);
-        resolve();
-      });
-    });
+    const out = await runUpdateCommand(config.ytDlpPath, ["-U"], 120000);
+    console.log(`🔄 yt-dlp -U: ${out.slice(-300).trim() || "no output"}`);
+    if (/pip install|installed with pip|use pip/i.test(out)) {
+      console.log("🔄 yt-dlp is a pip install — upgrading via pip (nightly channel, like build.sh)…");
+      const pipOut = await tryPipUpgrade();
+      console.log(`🔄 pip upgrade: ${pipOut.slice(-300).trim() || "no output"}`);
+    }
   } catch (err: any) {
     console.warn(`⚠️ yt-dlp self-update failed: ${(err?.message || String(err)).slice(0, 120)}`);
   }
+}
+
+/** Run an updater command, resolving with combined output even on non-zero exit. */
+function runUpdateCommand(bin: string, args: string[], timeoutMs: number): Promise<string> {
+  return new Promise((resolve) => {
+    import("child_process").then(({ spawn: spawnProc }) => {
+      const proc = spawnProc(bin, args, { shell: false });
+      let out = "";
+      proc.stdout?.on("data", (d: Buffer) => { out += d.toString(); });
+      proc.stderr?.on("data", (d: Buffer) => { out += d.toString(); });
+      const timer = setTimeout(() => { try { proc.kill(); } catch {} resolve(out || "timed out"); }, timeoutMs);
+      proc.on("close", () => {
+        clearTimeout(timer);
+        resolve(out);
+      });
+      proc.on("error", (err) => {
+        clearTimeout(timer);
+        resolve(`spawn failed: ${err.message}`);
+      });
+    }).catch((err) => resolve(`spawn failed: ${(err as Error)?.message || String(err)}`));
+  });
+}
+
+/** Upgrade a pip-installed yt-dlp (tries python3/pip/python launchers in order). */
+async function tryPipUpgrade(): Promise<string> {
+  const attempts: Array<{ bin: string; args: string[] }> = [
+    { bin: "python3", args: ["-m", "pip", "install", "-U", "--pre", "yt-dlp[default]"] },
+    { bin: "pip", args: ["install", "-U", "--pre", "yt-dlp[default]"] },
+    { bin: "python", args: ["-m", "pip", "install", "-U", "--pre", "yt-dlp[default]"] },
+  ];
+  let last = "no pip launcher found";
+  for (const a of attempts) {
+    const out = await runUpdateCommand(a.bin, a.args, 180000);
+    if (/Successfully installed|Requirement already satisfied/i.test(out)) return out;
+    last = out;
+  }
+  return last;
 }
 
 // --- Capability probes (cached) -------------------------------------------
@@ -1056,84 +1089,9 @@ export function cleanupFile(filePath: string): void {
   } catch {}
 }
 
-/**
- * Normalize a Pinterest MP4 for maximum player compatibility.
- *
- * Pinterest files (direct progressive MP4s and HLS merges) can carry
- * timestamp quirks that make strict players show a black/frozen picture
- * while the audio keeps playing. A fast stream-copy remux (no re-encode)
- * rebuilds timestamps and puts moov first. It also re-validates the file:
- * ffmpeg fails loudly on corrupt input. Never throws — returns the original
- * result on any failure (missing ffmpeg included).
- */
-async function normalizePinterestMp4(result: DownloadResult): Promise<DownloadResult> {
-  if (getFfmpegVersion() === null) return result;
-  const fixedPath = result.filePath.replace(/\.mp4$/i, "") + "_norm.mp4";
-  try {
-    await new Promise<void>((resolve, reject) => {
-      const proc = spawn(
-        getFfmpegBinary(),
-        [
-          "-y", "-v", "error",
-          "-fflags", "+genpts",
-          "-i", result.filePath,
-          "-c", "copy", "-map", "0",
-          "-movflags", "+faststart",
-          fixedPath,
-        ],
-        { shell: false }
-      );
-      let err = "";
-      proc.stderr.on("data", (d: Buffer) => { err += d.toString(); });
-      proc.on("error", reject);
-      proc.on("close", (code) => (code === 0 ? resolve() : reject(new Error(err.slice(-300) || `ffmpeg exit ${code}`))));
-    });
-    const stat = fs.statSync(fixedPath);
-    if (stat.size === 0) throw new Error("empty remux output");
-    try { fs.unlinkSync(result.filePath); } catch {}
-    console.log(`📌 Pinterest MP4 normalized for playback: ${path.basename(fixedPath)} (${(stat.size / 1048576).toFixed(1)} MB)`);
-    return { ...result, filePath: fixedPath, fileName: path.basename(fixedPath), size: stat.size };
-  } catch (err: any) {
-    try { if (fs.existsSync(fixedPath)) fs.unlinkSync(fixedPath); } catch {}
-    console.warn(`⚠️ Pinterest normalize skipped, sending original: ${(err?.message || String(err)).slice(0, 130)}`);
-    return result;
-  }
-}
-
-/** ffmpeg version string when the binary runs, else null. Cached. */
-let _ffmpegVersion: string | null | undefined;
-export function getFfmpegVersion(): string | null {
-  if (_ffmpegVersion !== undefined) return _ffmpegVersion;
-  try {
-    const out = execSync(`"${getFfmpegBinary()}" -version`, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
-    _ffmpegVersion = out.split("\n")[0].replace(/^ffmpeg version\s+/, "").split(/\s+/)[0] || "unknown";
-  } catch {
-    _ffmpegVersion = null;
-  }
-  return _ffmpegVersion;
-}
-
-/** Resolve the ffmpeg binary: explicit FFMPEG_PATH file > local dir binary > PATH. */
-function getFfmpegBinary(): string {
-  const envPath = (process.env.FFMPEG_PATH || "").trim();
-  if (envPath) {
-    try {
-      const resolved = path.resolve(envPath);
-      if (fs.existsSync(resolved) && fs.statSync(resolved).isFile()) return resolved;
-    } catch {}
-    // If FFMPEG_PATH points to something on PATH or is a dir, fall through.
-    if (!envPath.includes("/") && !envPath.includes("\\")) return envPath;
-  }
-  const localWin = path.join(config.ffmpegDir, "ffmpeg.exe");
-  const localNix = path.join(config.ffmpegDir, "ffmpeg");
-  try {
-    if (fs.existsSync(localWin)) return localWin;
-  } catch {}
-  try {
-    if (fs.existsSync(localNix)) return localNix;
-  } catch {}
-  return process.platform === "win32" ? "ffmpeg.exe" : "ffmpeg";
-}
+// NOTE: ffmpeg helpers (getFfmpegBinary/getFfmpegVersion/probeMedia) and
+// normalizePinterestMp4 live in ./media so both downloader.ts and
+// pinterest.ts can use them without a runtime import cycle.
 
 /**
  * Extract the video's audio track to MP3 using ffmpeg.
