@@ -9,8 +9,23 @@ const UA =
 
 /** Extract the 11-char YouTube video ID from any common URL form. */
 export function extractYouTubeId(url: string): string | null {
+  const candidates = [url.trim()];
+  // Attribution / share links embed an encoded watch URL (u=/watch%3Fv%3D…):
+  // decode once so the normal patterns below can match it.
   try {
-    const u = new URL(url.trim());
+    const decoded = decodeURIComponent(url.trim());
+    if (decoded !== url.trim()) candidates.push(decoded);
+  } catch {}
+  for (const candidate of candidates) {
+    const id = extractYouTubeIdFromPlain(candidate);
+    if (id) return id;
+  }
+  return null;
+}
+
+function extractYouTubeIdFromPlain(url: string): string | null {
+  try {
+    const u = new URL(url);
     const host = u.hostname.toLowerCase().replace(/^www\./, "").replace(/^m\./, "");
     if (host === "youtu.be") {
       const id = u.pathname.split("/").filter(Boolean)[0];
@@ -21,14 +36,18 @@ export function extractYouTubeId(url: string): string | null {
       const v = u.searchParams.get("v");
       if (v && /^[A-Za-z0-9_-]{11}$/.test(v)) return v;
       // /shorts/ID, /embed/ID, /live/ID, /v/ID, /short/ID
-      const m = u.pathname.match(/\/(?:shorts|embed|live|v|short)\/([A-Za-z0-9_-]{11})/);
+      const m = u.pathname.match(/\/(?:shorts|embed|live|v|short)\/([A-Za-z0-9_-]{11})(?![A-Za-z0-9_-])/);
       if (m) return m[1];
     }
   } catch {}
-  // Fallback: raw ID or regex scan.
-  const m = url.match(/([A-Za-z0-9_-]{11})/);
-  if (m && /(?:youtube|youtu\.be|shorts|watch)/i.test(url)) return m[1];
-  return null;
+  // Tight fallback: the token must look like a video reference (v= param or
+  // /path/ segment with a delimiter after it) — never an arbitrary 11-char
+  // run, which misfires on playlist IDs (?list=PL…) and channel handles
+  // (/@SomeChannel) and sends every provider chasing a garbage ID.
+  // Only for URLs that are actually YouTube links.
+  if (!/(?:youtube|youtu\.be)/i.test(url)) return null;
+  const m = url.match(/(?:[?&#/]v=|\/)([A-Za-z0-9_-]{11})(?![A-Za-z0-9_-])/);
+  return m ? m[1] : null;
 }
 
 interface InvidiousFormat {

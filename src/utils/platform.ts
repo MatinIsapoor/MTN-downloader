@@ -1,22 +1,37 @@
 export type Platform = "tiktok" | "youtube" | "twitter" | "instagram" | "pinterest" | "unknown";
 
+/** True for Pinterest hosts in any locale: pinterest.com, pinterest.de/.fr/.co.uk/…, and regional subdomains. */
+function isPinterestHost(host: string): boolean {
+  if (host === "pinterest.com" || host.endsWith(".pinterest.com")) return true;
+  // Country domains: pinterest.<tld> with optional subdomains (www./m. already stripped).
+  return /(^|\.)pinterest\.[a-z]{2,}(?:\.[a-z]{2,})?$/.test(host);
+}
+
+/** True for pin.it short links (exact host or subdomain). */
+function isPinItHost(host: string): boolean {
+  return host === "pin.it" || host.endsWith(".pin.it");
+}
+
 export function detectPlatform(url: string): Platform {
   // Hostname-based detection (avoids substring traps like "t.co" matching
-  // "pinterest.com", since "pinterest.com" contains "t.co").
+  // "pinterest.com", since "pinterest.com" contains "t.co"). When the URL
+  // parses, the hostname is authoritative — lookalike hosts (notpinterest.com,
+  // pinterest.com.evil.com) must NOT match.
   try {
     const host = new URL(url.trim()).hostname.toLowerCase().replace(/^www\./, "").replace(/^m\./, "");
     if (host === "youtu.be" || host.endsWith("youtube.com") || host.endsWith("youtube-nocookie.com")) return "youtube";
     if (host.endsWith("tiktok.com") || host === "vm.tiktok.com" || host === "vt.tiktok.com") return "tiktok";
-    if (host === "pin.it" || host.endsWith("pinterest.com")) return "pinterest";
+    if (isPinItHost(host) || isPinterestHost(host)) return "pinterest";
     if (host === "x.com" || host.endsWith("twitter.com") || host === "t.co") return "twitter";
     if (host.endsWith("instagram.com") || host === "instagr.am") return "instagram";
+    return "unknown";
   } catch {}
-  // Fallback for malformed URLs: substring scan (pinterest before twitter —
-  // "pinterest.com" contains "t.co").
+  // Fallback for malformed URLs (no parseable hostname): substring scan
+  // (pinterest before twitter — "pinterest.com" contains "t.co").
   const u = url.toLowerCase();
   if (u.includes("youtube.com") || u.includes("youtu.be") || u.includes("youtube-nocookie")) return "youtube";
   if (u.includes("tiktok.com") || u.includes("vm.tiktok") || u.includes("vt.tiktok")) return "tiktok";
-  if (u.includes("pinterest.com") || u.includes("pin.it")) return "pinterest";
+  if (u.includes("pin.it") || u.includes("pinterest.")) return "pinterest";
   if (u.includes("twitter.com") || u.includes("x.com")) return "twitter";
   if (u.includes("instagram.com") || u.includes("instagr.am")) return "instagram";
   return "unknown";

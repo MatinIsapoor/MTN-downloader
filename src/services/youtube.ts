@@ -1,6 +1,6 @@
 import { config } from "../config";
 import { downloadViaCobalt, isCobaltConfigured } from "./cobalt";
-import { downloadYouTubeViaInvidious } from "./invidious";
+import { downloadYouTubeViaInvidious, extractYouTubeId } from "./invidious";
 import { downloadYouTubeViaPiped, getLastPipedSummary } from "./piped";
 import { downloadYouTubeViaAndroid } from "./android";
 import { downloadYouTubeViaYtDlp, getLastYtDlpSummary, ytDlpFallbackStatus } from "./youtubeYtdlp";
@@ -29,6 +29,17 @@ export async function downloadYouTubeCookieFree(
   url: string,
   onProgress?: (p: DownloadProgress) => void
 ): Promise<DownloadResult> {
+  // Fail fast for YouTube URLs that name no video (playlists, channels,
+  // clips, search/home pages…): no provider can download those, and running
+  // the whole rotation only ends in a misleading "private/deleted/bot-blocked"
+  // verdict after a long wait.
+  if (!extractYouTubeId(url)) {
+    throw new Error(
+      "❌ That YouTube link doesn't point to a single downloadable video (playlists, channels, clips, and search pages aren't supported).\n\n" +
+        "Please send a direct video or Shorts link (e.g. youtube.com/watch?v=… / youtube.com/shorts/… / youtu.be/…)."
+    );
+  }
+
   let ytdlpWalled = false;
 
   // --- 1) yt-dlp FIRST (primary method, when enabled) -----------------------
