@@ -25,13 +25,16 @@ function sanitizeFileName(name: string): string {
 }
 
 function decodeHtmlEntities(s: string): string {
+  // &amp; MUST be decoded LAST. Decoding it first turns a literal "&amp;lt;"
+  // into "<" (double decode) instead of the "&lt;" the page actually meant;
+  // pin titles are site/user-supplied so they can contain entity text.
   return s
-    .replace(/&amp;/g, "&")
     .replace(/&quot;/g, '"')
     .replace(/&#x27;/g, "'")
     .replace(/&#39;/g, "'")
     .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">");
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&");
 }
 
 function pickMeta(html: string, property: string): string | null {
@@ -52,9 +55,47 @@ function extFromUrl(fileUrl: string, fallback: string): string {
   try {
     const clean = fileUrl.split("?")[0].split("#")[0];
     const ext = path.extname(clean).slice(1).toLowerCase();
-    if (/^[a-z0-9]{2,5}$/.test(ext)) return ext;
+    // Restrict to real image extensions the sender recognises: on a bare-host
+    // URL ("https://host") path.extname returns "com", which saved the image
+    // with a bogus extension and made user.ts route it through replyWithVideo.
+    if (/^(jpe?g|png|webp|gif)$/.test(ext)) return ext;
   } catch {}
   return fallback;
+}
+
+/** Hard caps on third-party payloads we are willing to buffer (see readTextCapped). */
+const MAX_PAGE_BYTES = 12 * 1024 * 1024;
+const MAX_API_BYTES = 8 * 1024 * 1024;
+
+/**
+ * Read a fetch response body as UTF-8 text, refusing to buffer more than
+ * `maxBytes`. Both the pin page HTML and the PinResource JSON come from a third
+ * party: without a cap, an oversized body can exhaust a small free-tier host's
+ * memory before any parser sees it. Content-Length is checked first as a cheap
+ * early reject, but bytes are still counted while streaming so a missing or
+ * lying header cannot bypass the limit.
+ */
+async function readTextCapped(res: Response, maxBytes: number, what: string): Promise<string> {
+  const declared = Number(res.headers.get("content-length") || 0);
+  if (declared > maxBytes) throw new Error(`${what} response too large (${Math.ceil(declared / 1048576)}MB)`);
+  if (!res.body) return "";
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let received = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      received += value.length;
+      if (received > maxBytes) throw new Error(`${what} response too large (>${Math.ceil(maxBytes / 1048576)}MB)`);
+      chunks.push(value);
+    }
+  } finally {
+    // Cancel even on the size-limit throw so the socket/stream is released.
+    try { await reader.cancel(); } catch {}
+  }
+  return Buffer.concat(chunks).toString("utf8");
 }
 
 /**
@@ -84,10 +125,23 @@ async function fetchPinData(pinId: string): Promise<any> {
       signal: controller.signal,
     });
     if (res.status === 404) {
+      res.body?.cancel().catch(() => {});
       throw new Error("❌ Pin not found. It may be deleted, private, or the link is wrong.");
     }
-    if (!res.ok) throw new Error(`PinResource HTTP ${res.status}`);
-    const json: any = await res.json();
+    if (!res.ok) {
+      // Cancel instead of leaving a response body unread: undici keeps an
+      // unconsumed connection (and its socket) checked out until GC.
+      res.body?.cancel().catch(() => {});
+      throw new Error(`PinResource HTTP ${res.status}`);
+    }
+    // Cap the payload before parsing it (scraped JSON, not a trusted size).
+    const raw = await readTextCapped(res, MAX_API_BYTES, "PinResource");
+    let json: any;
+    try {
+      json = JSON.parse(raw);
+    } catch {
+      throw new Error("PinResource returned invalid JSON");
+    }
     const rr = json?.resource_response;
     if (!rr || rr.data == null) {
       const msg = String(rr?.error?.message || "");
@@ -188,7 +242,11 @@ function pickApiImage(data: any): string | null {
 }
 
 function pinTitle(data: any, pinId: string | null): string {
-  const raw = (data?.title || data?.grid_title || "").trim();
+  // Coerce BEFORE .trim(): title/grid_title come from scraped Pinterest JSON and
+  // are not guaranteed to be strings (number/array/null happen on odd pins);
+  // calling .trim() on a non-string threw a TypeError and aborted the whole
+  // direct-download path for an otherwise healthy pin.
+  const raw = String(data?.title || data?.grid_title || "").trim();
   if (raw) return raw;
   return pinId ? `pinterest_${pinId}` : "pinterest";
 }
@@ -238,10 +296,13 @@ async function fetchHtml(url: string, timeoutMs = 30000): Promise<{ html: string
       signal: controller.signal,
     });
     if (!res.ok) {
+      // Cancel the unread body so the connection returns to the pool (see
+      // fetchPinData); a dead pin is an expected path, not an exception.
+      res.body?.cancel().catch(() => {});
       if (res.status === 404) throw new Error("❌ Pin not found. It may be deleted, private, or the link is wrong.");
       throw new Error(`Pinterest page HTTP ${res.status}`);
     }
-    return { html: await res.text(), finalUrl: res.url || url };
+    return { html: await readTextCapped(res, MAX_PAGE_BYTES, "Pinterest page"), finalUrl: res.url || url };
   } catch (err: any) {
     if (err?.message?.startsWith("❌")) throw err;
     if (err?.name === "AbortError") throw new Error("❌ Pinterest timed out. Please try again.");
@@ -260,33 +321,54 @@ async function streamToFile(
   const maxBytes = config.maxFileSizeMB * 1024 * 1024;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 180000);
+  const tooLarge = () => new Error(`❌ File too large (>${config.maxFileSizeMB}MB). Try another pin.`);
   try {
     const res = await fetch(fileUrl, {
       headers: { "User-Agent": UA, Referer: referer },
       signal: controller.signal,
     });
-    if (!res.ok || !res.body) throw new Error(`Media server HTTP ${res.status}`);
+    if (!res.ok || !res.body) {
+      res.body?.cancel().catch(() => {});
+      throw new Error(`Media server HTTP ${res.status}`);
+    }
     const total = Number(res.headers.get("content-length") || 0);
     if (total > maxBytes) {
-      throw new Error(`❌ File too large (>${config.maxFileSizeMB}MB). Try another pin.`);
+      res.body.cancel().catch(() => {});
+      throw tooLarge();
     }
     const file = fs.createWriteStream(filePath);
+    // A WriteStream 'error' (ENOSPC, EACCES, socket death mid-write…) has no
+    // listener by default: Node re-emits it as an UNCAUGHT exception, which
+    // takes the whole bot down. Keep the first error and surface it through the
+    // write callback / end() below instead of letting it escape.
+    let fileError: Error | null = null;
+    file.on("error", (err: Error) => { if (!fileError) fileError = err; });
+    // Resolves when the fd is closed. Needed before unlinking a partial file:
+    // on Windows an open handle makes unlink fail, which leaked the temp file.
+    const closed = new Promise<void>((resolve) => file.once("close", () => resolve()));
     let received = 0;
     try {
       for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) {
         received += chunk.length;
-        if (received > maxBytes) {
-          file.destroy();
-          try { fs.unlinkSync(filePath); } catch {}
-          throw new Error(`❌ File too large (>${config.maxFileSizeMB}MB). Try another pin.`);
-        }
-        if (!file.write(chunk)) await new Promise<void>((r) => file.once("drain", r));
+        if (received > maxBytes) throw tooLarge();
+        // Callback-driven write: a disk error rejects here immediately instead
+        // of leaving us waiting for a 'drain' event that never fires after an
+        // error (the old code could hang the download forever).
+        await new Promise<void>((resolve, reject) => {
+          file.write(chunk, (err?: Error | null) => (err ? reject(err) : resolve()));
+        });
         if (total > 0 && onProgress) onProgress({ percent: (received / total) * 100 });
       }
-    } finally {
       await new Promise<void>((resolve, reject) => {
         file.end((err?: Error | null) => (err ? reject(err) : resolve()));
       });
+    } catch (err) {
+      file.destroy();
+      await closed;
+      // Prefer the write error as the cause even when a later destroy/end
+      // rejection (ERR_STREAM_DESTROYED) would mask the user-facing reason —
+      // this keeps "❌ File too large…" recognised as a size failure upstream.
+      throw fileError || err;
     }
   } catch (err: any) {
     try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch {}

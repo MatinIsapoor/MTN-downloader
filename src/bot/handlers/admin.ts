@@ -12,6 +12,7 @@ import {
 } from "../../database";
 import { getCookiesStatus, saveCookiesContent } from "../../services/downloader";
 import { config } from "../../config";
+import { escapeHtml } from "../../utils/escape";
 
 // Broadcast state: stores adminId -> waiting for text
 const broadcastWaiting = new Set<number>();
@@ -44,29 +45,31 @@ function cookiesStatusText(): string {
         : s.sessionDaysLeft <= 7
           ? `⚠️ expires in ${s.sessionDaysLeft}d — refresh soon`
           : `✅ fresh (~${s.sessionDaysLeft}d left)`;
+  // HTML, not Markdown: the file path can contain backslashes/underscores and
+  // an unescaped "_" would make Telegram reject the whole message.
   const lines = [
-    "🍪 *YouTube Cookies Status*",
+    "🍪 <b>YouTube Cookies Status</b>",
     "",
-    `Source: \`${s.source}\``,
-    `Path: \`${s.path}\``,
+    `Source: <code>${escapeHtml(s.source)}</code>`,
+    `Path: <code>${escapeHtml(s.path)}</code>`,
     `Valid: ${s.valid ? "✅ yes" : "❌ NO"}`,
-    `Session: ${freshness}`,
-    `Detail: ${s.detail}`,
+    `Session: ${escapeHtml(freshness)}`,
+    `Detail: ${escapeHtml(s.detail)}`,
   ];
   if (s.total >= 0) {
-    lines.push(`Total cookies: *${s.total}* (youtube: *${s.youtube}*, expired: *${s.expiredYoutube}*, expiring<7d: *${s.expiringSoon}*)`);
+    lines.push(`Total cookies: <b>${s.total}</b> (youtube: <b>${s.youtube}</b>, expired: <b>${s.expiredYoutube}</b>, expiring&lt;7d: <b>${s.expiringSoon}</b>)`);
     lines.push(`Login session: ${s.hasLoginSession ? "✅ detected" : "❌ MISSING (exported logged-out?)"}`);
   }
-  if (config.cookiesContent) lines.push("", "📌 `COOKIES_CONTENT` is set — file is restored from it on every boot (Render-safe).");
+  if (config.cookiesContent) lines.push("", "📌 <code>COOKIES_CONTENT</code> is set — file is restored from it on every boot (Render-safe).");
   else if (process.env.RENDER_EXTERNAL_URL)
-    lines.push("", "⚠️ On Render without `COOKIES_CONTENT`, an uploaded `cookies.txt` is LOST on restart/redeploy — set `COOKIES_CONTENT` too.");
+    lines.push("", "⚠️ On Render without <code>COOKIES_CONTENT</code>, an uploaded <code>cookies.txt</code> is LOST on restart/redeploy — set <code>COOKIES_CONTENT</code> too.");
   lines.push(
     "",
-    "*Refresh (no restart needed):*",
-    "1\\. Log in at youtube\\.com in a FRESH private window \\(throwaway account recommended\\)",
-    "2\\. Export with “Get cookies\\.txt LOCALLY”, then close the window \\(don't log out\\)",
-    "3\\. Send the `cookies.txt` file to me HERE in chat — I apply it instantly",
-    "4\\. On Render: also paste its content into the `COOKIES_CONTENT` env var so it survives restarts"
+    "<b>Refresh (no restart needed):</b>",
+    "1. Log in at youtube.com in a FRESH private window (throwaway account recommended)",
+    "2. Export with “Get cookies.txt LOCALLY”, then close the window (don't log out)",
+    "3. Send the <code>cookies.txt</code> file to me HERE in chat — I apply it instantly",
+    "4. On Render: also paste its content into the <code>COOKIES_CONTENT</code> env var so it survives restarts"
   );
   return lines.join("\n");
 }
@@ -136,14 +139,14 @@ export function registerAdminHandlers(bot: Telegraf<Context>): void {
     const users = getAllUsers(15);
     if (users.length === 0) return ctx.reply("No users found.", { ...adminMenuKeyboard() });
 
-    const lines = ["👥 *Recent Users:*", ""];
+    const lines = ["👥 <b>Recent Users:</b>", ""];
     users.forEach((u, i) => {
-      lines.push(`${i + 1}. ${userRow(u)}`);
+      lines.push(escapeHtml(`${i + 1}. ${userRow(u)}`));
     });
-    lines.push("", `_Showing ${users.length} of ${getUserCount()} total_`);
+    lines.push("", `<i>Showing ${users.length} of ${getUserCount()} total</i>`);
 
     await ctx.reply(lines.join("\n"), {
-      parse_mode: "Markdown",
+      parse_mode: "HTML",
       ...adminMenuKeyboard(),
     });
   });
@@ -152,7 +155,9 @@ export function registerAdminHandlers(bot: Telegraf<Context>): void {
   bot.action("admin_find", async (ctx) => {
     await ctx.answerCbQuery();
     if (!adminOnly(ctx)) return;
-    broadcastWaiting.add(ctx.from.id);
+    // BUG FIX: this used to arm BROADCAST mode, so the search text the admin
+    // typed next was blasted to every user instead of being searched.
+    setFindWaiting(ctx.from.id);
     await ctx.reply("🔍 Send a username, name, or Telegram ID to search:");
   });
 
@@ -164,15 +169,15 @@ export function registerAdminHandlers(bot: Telegraf<Context>): void {
     const s = getOverallStats();
     if (s.topUsers.length === 0) return ctx.reply("No user data yet.", { ...adminMenuKeyboard() });
 
-    const lines = ["🏆 *Top Users by Downloads:*", ""];
+    const lines = ["🏆 <b>Top Users by Downloads:</b>", ""];
     s.topUsers.forEach((u, i) => {
       const medal = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `${i + 1}.`;
       const name = u.username ? `@${u.username}` : u.first_name || "N/A";
-      lines.push(`${medal} ${name} \\[${u.telegram_id}\\] \\- *${u.download_count}* downloads`);
+      lines.push(`${medal} ${escapeHtml(name)} [${u.telegram_id}] — <b>${u.download_count}</b> downloads`);
     });
 
     await ctx.reply(lines.join("\n"), {
-      parse_mode: "MarkdownV2",
+      parse_mode: "HTML",
       ...adminMenuKeyboard(),
     });
   });
@@ -222,12 +227,12 @@ export function registerAdminHandlers(bot: Telegraf<Context>): void {
     const seen = new Date(user.last_seen).toLocaleDateString();
 
     const text = [
-      "👤 *User Details*",
+      "👤 <b>User Details</b>",
       "",
-      `Name: ${name}`,
-      `ID: *${user.telegram_id}*`,
+      `Name: ${escapeHtml(name)}`,
+      `ID: <b>${user.telegram_id}</b>`,
       `Status: ${status}`,
-      `Downloads: *${user.download_count}*`,
+      `Downloads: <b>${user.download_count}</b>`,
       `Joined: ${joined}`,
       `Last seen: ${seen}`,
     ].join("\n");
@@ -237,7 +242,7 @@ export function registerAdminHandlers(bot: Telegraf<Context>): void {
       : [[Markup.button.callback("🚫 Ban", `ban:${tid}`)]];
 
     await ctx.reply(text, {
-      parse_mode: "Markdown",
+      parse_mode: "HTML",
       reply_markup: { inline_keyboard: buttons },
     });
   });
@@ -246,12 +251,12 @@ export function registerAdminHandlers(bot: Telegraf<Context>): void {
   bot.action("admin_cookies", async (ctx) => {
     await ctx.answerCbQuery();
     if (!adminOnly(ctx)) return;
-    await ctx.reply(cookiesStatusText(), { parse_mode: "Markdown" });
+    await ctx.reply(cookiesStatusText(), { parse_mode: "HTML" });
   });
 
   bot.command("cookies", async (ctx) => {
     if (!adminOnly(ctx)) return;
-    await ctx.reply(cookiesStatusText(), { parse_mode: "Markdown" });
+    await ctx.reply(cookiesStatusText(), { parse_mode: "HTML" });
   });
 
   // ── Cookies refresh via file upload ──
@@ -315,11 +320,12 @@ export function registerAdminHandlers(bot: Telegraf<Context>): void {
     }
   });
 
-  // ── Cancel broadcast ──
+  // ── Cancel broadcast / find ──
   bot.command("cancel", (ctx) => {
-    if (broadcastWaiting.has(ctx.from.id)) {
-      broadcastWaiting.delete(ctx.from.id);
-      ctx.reply("❌ Broadcast cancelled.");
+    const wasBroadcasting = broadcastWaiting.delete(ctx.from.id);
+    const wasFinding = findWaiting.delete(ctx.from.id);
+    if (wasBroadcasting || wasFinding) {
+      ctx.reply("❌ Cancelled.").catch(() => {});
     }
   });
 }
@@ -341,7 +347,10 @@ export async function handleAdminText(ctx: Context): Promise<boolean> {
 
     if (!adminOnly(ctx)) return true;
 
-    const users = getAllUsers(5000); // get all
+    // Banned users cannot use the bot, so messaging them is wasted work and
+    // extra rate-limit pressure; getAllUsers(5000) also keeps the "all users"
+    // query bounded instead of loading an unbounded table.
+    const users = getAllUsers(5000).filter((u) => !u.is_banned);
     let sent = 0;
     let failed = 0;
 
@@ -349,13 +358,25 @@ export async function handleAdminText(ctx: Context): Promise<boolean> {
 
     for (const u of users) {
       try {
-        await ctx.telegram.sendMessage(u.telegram_id, text, { parse_mode: "Markdown" }).catch(() => {
-          return ctx.telegram.sendMessage(u.telegram_id, text);
-        });
+        // Admin text is arbitrary: if it is not valid Markdown, Telegram
+        // rejects it, so fall back to plain text for that recipient.
+        try {
+          await ctx.telegram.sendMessage(u.telegram_id, text, { parse_mode: "Markdown" });
+        } catch {
+          await ctx.telegram.sendMessage(u.telegram_id, text);
+        }
         sent++;
-      } catch {
+      } catch (err: any) {
         failed++;
+        // Telegram's global limit is ~30 messages/second; when we trip a 429
+        // every subsequent send fails. Honour retry_after instead of hammering.
+        const retryAfter = Number(err?.parameters?.retry_after ?? 0);
+        if (/429|too many requests/i.test(String(err?.message || "")) && retryAfter > 0) {
+          await new Promise((r) => setTimeout(r, Math.min(retryAfter, 60) * 1000));
+        }
       }
+      // ~28 messages/second — safely under the Bot API limit for 1-to-1 sends.
+      await new Promise((r) => setTimeout(r, 35));
     }
 
     await ctx.telegram.editMessageText(
@@ -367,14 +388,6 @@ export async function handleAdminText(ctx: Context): Promise<boolean> {
     );
 
     return true;
-  }
-
-  // Check find user mode
-  if (broadcastWaiting.has(userId) && "text" in ctx.message!) {
-    // Actually broadcastWaiting is reused for find. Let's differentiate.
-    // We'll check if the message looks like a search query (no broadcast context).
-    // Simpler: use a separate set for find mode.
-    return false;
   }
 
   return false;
@@ -410,10 +423,10 @@ export async function handleFindText(ctx: Context): Promise<boolean> {
     return true;
   }
 
-  const lines = [`🔍 *Found ${results.length} users:*`, ""];
+  const lines = [`🔍 <b>Found ${results.length} users:</b>`, ""];
   results.forEach((u, i) => {
     const name = u.username ? `@${u.username}` : u.first_name || "N/A";
-    lines.push(`${i + 1}. ${u.is_banned ? "🚫" : "✅"} [${u.telegram_id}] ${name} | DL: ${u.download_count}`);
+    lines.push(escapeHtml(`${i + 1}. ${u.is_banned ? "🚫" : "✅"} [${u.telegram_id}] ${name} | DL: ${u.download_count}`));
   });
   lines.push("\nSend a user ID to see details, or use buttons below.");
 
@@ -421,7 +434,7 @@ export async function handleFindText(ctx: Context): Promise<boolean> {
   const buttons = results.slice(0, 5).map((u) => [Markup.button.callback(`${u.username || u.first_name || u.telegram_id}`, `userinfo:${u.telegram_id}`)]);
 
   await ctx.reply(lines.join("\n"), {
-    parse_mode: "Markdown",
+    parse_mode: "HTML",
     reply_markup: { inline_keyboard: buttons },
   });
 

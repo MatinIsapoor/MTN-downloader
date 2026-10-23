@@ -154,7 +154,7 @@ telegram/
 - Or set `YT_DLP_PATH` in .env to full path
 
 **YouTube: "Sign in to confirm you're not a bot" / do I need cookies?**
-- Usually NO extra setup now. YouTube downloads try a fast non-yt-dlp path FIRST: a public Invidious instance resolves the direct MP4 (`INVIDIOUS_ENABLED=true` by default) — the instance's IP talks to YouTube, not your server's, so datacenter bot-checks don't apply, and there's no JS challenge, no cookies, and no slow DASH merge. yt-dlp (anonymous clients, then cookies) is the automatic fallback.
+- Usually NO extra setup needed. YouTube runs through LOCAL yt-dlp first (`YOUTUBE_YTDLP_FIRST=true`, anonymous player clients with per-client rotation), then falls back to the cookie-free HTTPS providers (Cobalt if configured → youtubei multi-client → Piped → Invidious). Those providers talk to YouTube from their own IPs, so datacenter bot-checks don't apply to them; cookies are only used when a video requires a login.
 - Honest limit (2026): most public Invidious instances now disable their API (`/api/v1/*` → HTTP 403), and Piped's public network is effectively dead — so the fast path is best-effort and your logs will often show `All Invidious instances failed … falling back to yt-dlp`. That fallback is the real pipeline now: it tries `android → mweb → web_embedded → web_safari → tv_embedded → mediaconnect → default` with `player_skip=webpage,configs` + `--force-ipv4`. When ALL of those return `Sign in to confirm you're not a bot`, YouTube has flagged the server IP for that video — not a bug in the bot.
 - Triage in order: (1) send a DIFFERENT public YouTube link — if it works, only the first video is login-walled and cookies are the only fix; (2) if EVERY video fails, redeploy (fresh yt-dlp nightly) or set `YTDLP_AUTO_UPDATE=true` for self-update on boot — the bot now warns at startup when the build is >14 days old; (3) if it persists, the IP is flagged — set `YT_DLP_PROXY` to a residential proxy (the only real fix for a flagged IP); (4) optional advanced: run a bgutil PO-token sidecar and set `POT_SERVER_URL` (see `build.sh POT_PROVIDER=1`).
 - Cookies are only a fallback for age-gated, private/members-only, or IP-rate-limited videos.
@@ -184,7 +184,7 @@ telegram/
   in `.env` so yt-dlp reads cookies straight from your browser.
 
 **Slow YouTube downloads?**
-- YouTube normally skips yt-dlp entirely now: the Invidious fast path downloads a single muxed MP4 (no ffmpeg video+audio merge, the slowest step on small hosts), capped at 720p (`YOUTUBE_MAX_HEIGHT=720`, set `1080`/`0` for full quality) — 720p is 3-5x smaller, so it downloads and uploads to Telegram much faster and stays under the 50MB bot limit.
+- YouTube uses local yt-dlp as the primary engine (per-client rotation, cookies, proxy) and falls back to single-file HTTPS providers. Quality is capped at 720p (`YOUTUBE_MAX_HEIGHT=720`, set `1080`/`0` for full quality) — 720p is 3-5x smaller, so it downloads and uploads to Telegram much faster and stays under the 50MB bot limit.
 - The yt-dlp fallback path also uses 10MB HTTP chunks (throttle bypass), 8 parallel fragments, fast
   failover between player clients, and aria2c with 8 connections when installed
   (`build.sh` tries to install it; startup logs confirm).
@@ -212,6 +212,16 @@ telegram/
 **Download hangs**
 - Some platforms have rate limits
 - Try again after a few minutes
+
+## Render free plan: known limits
+
+The defaults are tuned for Render's free instance (512MB RAM, 0.1 CPU, ephemeral disk):
+
+- **The filesystem is ephemeral and free plans cannot attach a persistent disk.** `data/bot.db` (users, stats, history) is wiped on every restart/redeploy and `cookies.txt` is restored from `COOKIES_CONTENT` only if that env var is set. Per-download media files under `downloads/` are deleted after each send anyway.
+- **Uploads are capped at 50MB** by Telegram's cloud Bot API. Keep `MAX_FILE_SIZE_MB` ≤ 50 (the bot now refuses larger files with a clear message instead of failing at upload).
+- **0.1 CPU is not enough for ffmpeg re-encoding.** `PINTEREST_NORMALIZE=false` is set in `render.yaml`: Pinterest MP4s are sent as-is (fixes timeouts, but some players may show black video + audio on those pins). Set it to `true` on a paid plan.
+- **The instance spins down after ~15 min of inactivity**, so `KEEPALIVE_*`/the `/health` endpoint and an external pinger (UptimeRobot/cron-job.org, every 5 min) are what keep it awake.
+- Downloads are queued, not parallel (`MAX_CONCURRENT_DOWNLOADS=2` default): each yt-dlp/ffmpeg child is expensive on 512MB.
 
 ## License
 

@@ -50,8 +50,10 @@ else
 fi
 
 # نصب وابستگی‌های Node.js
+# npm ci is deterministic and faster than install; fall back when the lockfile
+# and package.json disagree (e.g. after a manual dependency bump).
 echo "Installing Node.js dependencies..."
-npm install
+npm ci --no-audit --no-fund || npm install --no-audit --no-fund
 
 # ساخت پروژه
 echo "Building project..."

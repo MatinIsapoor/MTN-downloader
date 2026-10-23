@@ -1,6 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import * as crypto from "crypto";
+import { once } from "events";
 import { config } from "../config";
 import { TooLargeError } from "./quality";
 import type { DownloadProgress, DownloadResult } from "./downloader";
@@ -109,6 +110,36 @@ export function pickFormatsSorted(
   return [...known.map((x) => x.f), ...unknown];
 }
 
+/** Cap for JSON metadata bodies. Instance APIs answer in the low hundreds of KB. */
+const MAX_API_BODY_BYTES = 4 * 1024 * 1024;
+
+/**
+ * Read a response body as UTF-8 text with a hard byte cap.
+ *
+ * The public instances we talk to are untrusted third parties: a broken (or
+ * hostile) instance can stream an unbounded body — or a huge HTML error page
+ * where JSON was promised — and the old `res.json()` buffered ALL of it in
+ * RAM before parsing. On a ~512MB host that is an easy OOM. Crossing the cap
+ * cancels the body so the socket is released instead of draining forever.
+ */
+export async function readBodyCapped(res: Response, maxBytes: number): Promise<string> {
+  const body = res.body;
+  if (!body) throw new Error("empty response body");
+  const chunks: Buffer[] = [];
+  let received = 0;
+  for await (const chunk of body as unknown as AsyncIterable<Uint8Array>) {
+    received += chunk.length;
+    if (received > maxBytes) {
+      try {
+        await body.cancel();
+      } catch {}
+      throw new Error(`response too large (>${Math.round(maxBytes / 1024)}KB)`);
+    }
+    chunks.push(Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
 async function fetchJsonWithTimeout(url: string, timeoutMs: number): Promise<any> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -117,8 +148,21 @@ async function fetchJsonWithTimeout(url: string, timeoutMs: number): Promise<any
       headers: { "User-Agent": UA, Accept: "application/json" },
       signal: controller.signal,
     });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return await res.json();
+    if (!res.ok) {
+      // Release the socket for a body we are not going to read.
+      try {
+        await res.body?.cancel();
+      } catch {}
+      throw new Error(`HTTP ${res.status}`);
+    }
+    const text = await readBodyCapped(res, MAX_API_BODY_BYTES);
+    try {
+      return JSON.parse(text);
+    } catch {
+      // HTML challenge pages / truncated bodies land here — give the caller a
+      // clear cause instead of a raw SyntaxError about an unexpected "<".
+      throw new Error("invalid JSON response");
+    }
   } finally {
     clearTimeout(timeout);
   }
@@ -147,8 +191,12 @@ async function resolveInstances(): Promise<string[]> {
         health: Number(info?.monitor?.statusClass === "success" ? 1 : 0),
       }))
       .filter((x) => x.uri.startsWith("https://"));
-    const apiOn = healthy.filter((x) => x.api).map((x) => x.uri);
-    const apiOff = healthy.filter((x) => !x.api).map((x) => x.uri);
+    // `monitor.statusClass` was parsed into `health` but never used, so an
+    // offline instance could stay ahead of a live one in the rotation. Prefer
+    // healthy instances within each group; unknown health (missing monitor
+    // data) simply sorts last instead of being dropped.
+    const apiOn = healthy.filter((x) => x.api).sort((a, b) => b.health - a.health).map((x) => x.uri);
+    const apiOff = healthy.filter((x) => !x.api).sort((a, b) => b.health - a.health).map((x) => x.uri);
     // Merge: live api-enabled first, then configured (may overlap), then rest.
     const merged = [...new Set([...apiOn, ...configured, ...apiOff])];
     if (merged.length > 0) {
@@ -168,6 +216,47 @@ function sanitizeFileName(name: string): string {
   return name.replace(/[\\/:*?"<>|]/g, "").replace(/\s+/g, " ").trim().slice(0, 80) || "video";
 }
 
+/**
+ * Guard a provider-supplied media URL before the bot fetches it.
+ *
+ * The MP4 URL comes from a public third-party instance's JSON (not from the
+ * user), so a broken or malicious instance could point the bot at the cloud
+ * metadata service (169.254.169.254), a localhost admin port or an internal
+ * hostname and make the server fetch it — a classic SSRF. fetch() only speaks
+ * http(s), but the HOST also has to be public, so reject the literal internal
+ * forms below. (A full fix needs an egress firewall; every legitimate CDN host
+ * passes this check unchanged.)
+ */
+export function assertSafeMediaUrl(mediaUrl: string): void {
+  let parsed: URL;
+  try {
+    parsed = new URL(mediaUrl);
+  } catch {
+    throw new Error("provider returned an invalid media URL");
+  }
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+    throw new Error(`provider returned a non-HTTP media URL (${parsed.protocol})`);
+  }
+  const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  const isIpv6 = host.includes(":");
+  const internal =
+    host === "localhost" ||
+    host.endsWith(".localhost") ||
+    host.endsWith(".local") ||
+    host.endsWith(".internal") ||
+    /^(?:0|127)\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host) ||
+    /^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host) ||
+    /^192\.168\.\d{1,3}\.\d{1,3}$/.test(host) ||
+    /^172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}$/.test(host) ||
+    /^169\.254\.\d{1,3}\.\d{1,3}$/.test(host) ||
+    (isIpv6 &&
+      (host === "::1" ||
+        host.startsWith("fe80:") ||
+        /^f[cd]/.test(host) ||
+        host.startsWith("::ffff:")));
+  if (internal) throw new Error(`provider returned an internal media URL (${host})`);
+}
+
 /** Stream a remote file to disk with Telegram max-size enforcement + progress. */
 async function streamToFile(
   fileUrl: string,
@@ -175,6 +264,8 @@ async function streamToFile(
   referer: string,
   onProgress?: (p: DownloadProgress) => void
 ): Promise<number> {
+  // SSRF guard: the URL comes from the instance's JSON payload.
+  assertSafeMediaUrl(fileUrl);
   const maxBytes = config.maxFileSizeMB * 1024 * 1024;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 180000);
@@ -183,30 +274,68 @@ async function streamToFile(
       headers: { "User-Agent": UA, Referer: referer },
       signal: controller.signal,
     });
-    if (!res.ok || !res.body) throw new Error(`Video server HTTP ${res.status}`);
+    const body = res.body;
+    if (!res.ok || !body) {
+      // Release the socket for a body we are not going to read.
+      try {
+        await body?.cancel();
+      } catch {}
+      throw new Error(`Video server HTTP ${res.status}`);
+    }
     const total = Number(res.headers.get("content-length") || 0);
     if (total > maxBytes) {
+      try {
+        await body.cancel();
+      } catch {}
       throw new TooLargeError(`❌ This quality is over ${config.maxFileSizeMB}MB — trying a lower quality…`);
     }
     const file = fs.createWriteStream(filePath);
+    // A write-side failure (disk full, permissions) is emitted as an 'error'
+    // event. With no listener Node turns it into an uncaught exception and
+    // kills the whole bot — and the drain wait below would never settle.
+    let writeError: Error | null = null;
+    file.on("error", (err) => {
+      writeError = writeError || err;
+    });
     let received = 0;
+    let tooLarge = false;
     try {
-      for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) {
+      for await (const chunk of body as unknown as AsyncIterable<Uint8Array>) {
         received += chunk.length;
         if (received > maxBytes) {
-          file.destroy();
-          try {
-            fs.unlinkSync(filePath);
-          } catch {}
-          throw new TooLargeError(`❌ This quality is over ${config.maxFileSizeMB}MB — trying a lower quality…`);
+          // Do NOT destroy() here: end() on a destroyed stream rejects with
+          // ERR_STREAM_DESTROYED, which REPLACES this TooLargeError and makes
+          // the caller treat "retry a lower rendition" as a provider failure.
+          // Stop reading, close the file cleanly, delete it below.
+          tooLarge = true;
+          break;
         }
-        if (!file.write(chunk)) await new Promise<void>((r) => file.once("drain", r));
+        if (!file.write(chunk)) {
+          // No 'drain' will ever arrive on an already-failed stream — fail
+          // fast instead of hanging. events.once() covers a failure that
+          // happens while waiting, so this wait always settles.
+          if (writeError) throw writeError;
+          await once(file, "drain");
+        }
         if (total > 0 && onProgress) onProgress({ percent: (received / total) * 100 });
       }
     } finally {
-      await new Promise<void>((resolve, reject) => {
-        file.end((err?: Error | null) => (err ? reject(err) : resolve()));
+      // Close (or finish closing) unconditionally so no half-open handle or
+      // partial file is left behind, and never let this throw: it would mask
+      // the real error that sent us here.
+      await new Promise<void>((resolve) => {
+        file.end((err?: Error | null) => {
+          if (err) writeError = writeError || err;
+          resolve();
+        });
       });
+    }
+    if (writeError) throw writeError;
+    if (tooLarge) {
+      try {
+        fs.unlinkSync(filePath);
+      } catch {}
+      throw new TooLargeError(`❌ This quality is over ${config.maxFileSizeMB}MB — trying a lower quality…`);
     }
     return received;
   } catch (err: any) {
@@ -214,7 +343,10 @@ async function streamToFile(
       if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
     } catch {}
     if (err instanceof TooLargeError) throw err;
-    if (err?.name === "AbortError") throw new Error("❌ Download timed out. Please try again.");
+    // NOTE: no ❌ prefix — callers treat ❌ as "the video itself is
+    // unwinnable". A slow/aborted media host is only THIS provider failing,
+    // so the pipeline must be allowed to continue with the next method.
+    if (err?.name === "AbortError") throw new Error("Download timed out (video server too slow or blocked).");
     throw err instanceof Error ? err : new Error(`❌ Download failed: ${err}`);
   } finally {
     clearTimeout(timeout);

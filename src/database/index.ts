@@ -33,10 +33,35 @@ export interface StatRow {
 
 let db: SqlJsDatabase;
 
+let _persistWarned = false;
+
+/**
+ * Flush the in-memory sql.js database to disk.
+ *
+ * Written to a temp file and renamed over the target: sql.js exports the WHOLE
+ * database on every write, so a crash/kill mid-`writeFileSync` used to leave a
+ * truncated bot.db that fails to open on the next boot (free-tier hosts restart
+ * often). A rename is atomic, so the file on disk is always a complete image.
+ * Errors are logged, not thrown: a full disk must not crash an update handler.
+ */
 function persist(): void {
-  const data = db.export();
-  const buffer = Buffer.from(data);
-  fs.writeFileSync(config.databasePath, buffer);
+  try {
+    const data = db.export();
+    const tmp = `${config.databasePath}.tmp`;
+    fs.writeFileSync(tmp, Buffer.from(data));
+    try {
+      fs.renameSync(tmp, config.databasePath);
+    } catch {
+      // Some filesystems/shared mounts refuse rename-over-existing; fall back.
+      fs.writeFileSync(config.databasePath, Buffer.from(data));
+      try { fs.unlinkSync(tmp); } catch {}
+    }
+  } catch (err: any) {
+    if (!_persistWarned) {
+      _persistWarned = true;
+      console.error(`⚠️ Could not persist database to ${config.databasePath}: ${err?.message || err}`);
+    }
+  }
 }
 
 export function getDb(): SqlJsDatabase {
@@ -119,6 +144,14 @@ function runSql(sql: string, params: any[] = []): void {
 
 // ── User helpers ──
 
+/**
+ * How stale `last_seen` must get before we rewrite the whole DB for it.
+ * sql.js persists the entire database on every write, and the auth middleware
+ * touches upsertUser on EVERY update — without this throttle a chatty bot
+ * re-serializes the DB file dozens of times a minute on 0.1 CPU.
+ */
+const LAST_SEEN_THROTTLE_MS = 10 * 60 * 1000;
+
 export function upsertUser(data: {
   telegram_id: number;
   username?: string | null;
@@ -129,9 +162,18 @@ export function upsertUser(data: {
   const existing = queryOne("SELECT * FROM users WHERE telegram_id = ?", [data.telegram_id]) as User | undefined;
 
   if (existing) {
+    const username = data.username ?? existing.username;
+    const firstName = data.first_name ?? existing.first_name;
+    const lastName = data.last_name ?? existing.last_name;
+    const changed =
+      username !== existing.username || firstName !== existing.first_name || lastName !== existing.last_name;
+    const lastSeenMs = Date.parse(existing.last_seen);
+    const recordStale = !Number.isFinite(lastSeenMs) || Date.now() - lastSeenMs > LAST_SEEN_THROTTLE_MS;
+    // Nothing meaningful changed and the heartbeat is fresh: skip the write.
+    if (!changed && !recordStale) return existing;
     runSql(
       "UPDATE users SET username = ?, first_name = ?, last_name = ?, last_seen = ? WHERE telegram_id = ?",
-      [data.username ?? existing.username, data.first_name ?? existing.first_name, data.last_name ?? existing.last_name, now, data.telegram_id]
+      [username, firstName, lastName, now, data.telegram_id]
     );
     return queryOne("SELECT * FROM users WHERE telegram_id = ?", [data.telegram_id]) as User;
   }

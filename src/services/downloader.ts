@@ -62,21 +62,47 @@ export function getActiveDownloadCount(): number {
   return activeDownloads;
 }
 
-function checkYtDlp(): boolean {
+/** Run a shell command, ignoring its output. Bounded so a hung binary can't block boot. */
+function commandWorks(cmd: string, timeoutMs = 15000): boolean {
   try {
-    execSync(`"${config.ytDlpPath}" --version`, { stdio: "ignore" });
+    execSync(cmd, { stdio: "ignore", timeout: timeoutMs, windowsHide: true });
     return true;
   } catch {
     return false;
   }
 }
 
+// Capability probes are caches, not calls: `checkYtDlp()` runs on EVERY
+// download and the others at boot, and each spawn blocks the event loop for
+// 100-500ms (painful on the 0.1-CPU free tier). A successful probe rarely
+// changes, but the TTL lets a newly installed binary be picked up.
+const PROBE_TTL_MS = 5 * 60 * 1000;
+const _probeCache = new Map<string, { ok: boolean; at: number }>();
+
+function cachedProbe(key: string, run: () => boolean): boolean {
+  const hit = _probeCache.get(key);
+  if (hit && Date.now() - hit.at < PROBE_TTL_MS) return hit.ok;
+  const ok = run();
+  _probeCache.set(key, { ok, at: Date.now() });
+  return ok;
+}
+
+function checkYtDlp(): boolean {
+  return cachedProbe("yt-dlp", () => commandWorks(`"${config.ytDlpPath}" --version`));
+}
+
+let _ytDlpVersion: string | null | undefined;
 export function getYtDlpVersion(): string | null {
+  if (_ytDlpVersion !== undefined) return _ytDlpVersion;
   try {
-    return execSync(`"${config.ytDlpPath}" --version`, { encoding: "utf8" }).trim().split("\n")[0] || null;
+    _ytDlpVersion =
+      execSync(`"${config.ytDlpPath}" --version`, { encoding: "utf8", timeout: 20000, windowsHide: true })
+        .trim()
+        .split("\n")[0] || null;
   } catch {
-    return null;
+    _ytDlpVersion = null;
   }
+  return _ytDlpVersion;
 }
 
 /** Age of the yt-dlp build in days (parsed from YYYY.MM.DD version), null when unknown. */
@@ -161,28 +187,17 @@ async function tryPipUpgrade(): Promise<string> {
 let _hasNodeRuntime: boolean | null = null;
 /** yt-dlp can solve YouTube JS challenges / PO-token checks when a JS runtime is available. */
 function hasNodeRuntime(): boolean {
-  if (_hasNodeRuntime === null) {
-    try {
-      execSync("node --version", { stdio: "ignore" });
-      _hasNodeRuntime = true;
-    } catch {
-      _hasNodeRuntime = false;
-    }
-  }
+  if (_hasNodeRuntime === null) _hasNodeRuntime = cachedProbe("node", () => commandWorks("node --version"));
   return _hasNodeRuntime;
 }
 
 let _supportsImpersonate: boolean | null = null;
 /** --impersonate needs a yt-dlp build with curl_cffi; harmless to probe once and cache. */
 function supportsImpersonate(): boolean {
-  if (_supportsImpersonate === null) {
-    try {
-      execSync(`"${config.ytDlpPath}" --impersonate chrome --version`, { stdio: "ignore" });
-      _supportsImpersonate = true;
-    } catch {
-      _supportsImpersonate = false;
-    }
-  }
+  if (_supportsImpersonate === null)
+    _supportsImpersonate = cachedProbe("impersonate", () =>
+      commandWorks(`"${config.ytDlpPath}" --impersonate chrome --version`)
+    );
   return _supportsImpersonate;
 }
 
@@ -336,8 +351,19 @@ export function saveCookiesContent(raw: string): CookieStatus {
         fs.copyFileSync(config.cookiesPath, `${config.cookiesPath}.bak`);
       }
     } catch {}
-    const normalized = raw.trim().endsWith("\n") ? raw.trim() + "\n" : raw.trim() + "\n";
-    fs.writeFileSync(config.cookiesPath, normalized, "utf8");
+    // Normalize the trailing newline, then write atomically: a killed process
+    // mid-write must not leave a half-written cookies file behind (the .bak
+    // copy is only useful if the live file is either complete or untouched).
+    // 0600 keeps the YouTube session cookies unreadable to other users.
+    const normalized = raw.trim() + "\n";
+    const tmp = `${config.cookiesPath}.tmp`;
+    fs.writeFileSync(tmp, normalized, { encoding: "utf8", mode: 0o600 });
+    try {
+      fs.renameSync(tmp, config.cookiesPath);
+    } catch {
+      fs.writeFileSync(config.cookiesPath, normalized, { encoding: "utf8", mode: 0o600 });
+      try { fs.unlinkSync(tmp); } catch {}
+    }
   } catch (err: any) {
     throw new Error(`❌ Could not save cookies file (${config.cookiesPath}): ${err?.message || err}`);
   }
@@ -513,14 +539,7 @@ function tikTokUa(seed: number): string {
 let _hasAria2c: boolean | null = null;
 /** aria2c with 8 connections downloads progressive mp4s much faster than native. */
 function hasAria2c(): boolean {
-  if (_hasAria2c === null) {
-    try {
-      execSync("aria2c --version", { stdio: "ignore" });
-      _hasAria2c = true;
-    } catch {
-      _hasAria2c = false;
-    }
-  }
+  if (_hasAria2c === null) _hasAria2c = cachedProbe("aria2c", () => commandWorks("aria2c --version"));
   return _hasAria2c;
 }
 
@@ -563,9 +582,12 @@ function buildCommonArgs(useCookies = true, chunked = true): string[] {
     "--buffer-size", "16K",
     "--socket-timeout", "10",
     "--retries", "3",
-    "--fragment-retries", "3",
-    "--no-check-certificates"
+    "--fragment-retries", "3"
   );
+  // Opt-in only: skipping certificate checks would let a MITM tamper with the
+  // downloaded media. Kept available because a handful of CDNs serve broken
+  // chains (YT_DLP_INSECURE_TLS=true).
+  if (config.ytDlpInsecureTls) args.push("--no-check-certificates");
   if (chunked) args.push("--http-chunk-size", "10M");
   // aria2c (8 connections) is far faster than the native downloader for
   // progressive http mp4s, when it is installed. Probe once, use if present.
@@ -778,6 +800,15 @@ function resolveDownloadedFile(stdout: string, id: string, platform: string): Do
     throw new Error("Download completed but file not found. Check yt-dlp output.");
   }
 
+  // Never trust a path printed by an external tool: only accept a file this
+  // download wrote inside the downloads directory (the fallback scans above are
+  // already dir-scoped). Prevents reading/uploading an arbitrary local file if
+  // yt-dlp's output contract ever changes or is manipulated.
+  const downloadRoot = path.resolve(config.downloadDir) + path.sep;
+  if (!path.resolve(filePath).startsWith(downloadRoot)) {
+    throw new Error("Downloaded file is outside the download directory — refusing to use it.");
+  }
+
   const ext = path.extname(filePath).slice(1).toLowerCase() || "mp4";
 
   // GUARD: reject audio-only files
@@ -790,6 +821,17 @@ function resolveDownloadedFile(stdout: string, id: string, platform: string): Do
   }
 
   const stat = fs.statSync(filePath);
+  // --max-filesize is applied PER STREAM, so a DASH video+audio merge can end
+  // up over the cap even when each stream passed. Re-check the finished file:
+  // the message matches isTooLargeMessage(), so the caller retries a lower
+  // quality instead of handing Telegram an over-limit file.
+  const maxBytes = config.maxFileSizeMB * 1024 * 1024;
+  if (stat.size > maxBytes) {
+    try { fs.unlinkSync(filePath); } catch {}
+    throw new Error(
+      `Video too large after merge (${(stat.size / 1048576).toFixed(1)}MB > ${config.maxFileSizeMB}MB) — trying a lower quality is needed.`
+    );
+  }
   return { filePath, fileName: path.basename(filePath), ext, size: stat.size, platform };
 }
 
@@ -860,7 +902,12 @@ async function resolveViaSsstik(videoUrl: string): Promise<TikTokResolved> {
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
       const ua = tikTokUa(attempt + videoUrl.length);
-      const pageRes = await fetch("https://ssstik.io/en", { headers: { "User-Agent": ua } });
+      const pageRes = await fetch("https://ssstik.io/en", {
+        headers: { "User-Agent": ua },
+        // Without a signal this fetch can hang forever (undici has no default
+        // request timeout) and the whole TikTok fallback stalls with it.
+        signal: AbortSignal.timeout(20000),
+      });
       if (!pageRes.ok) throw new Error(`ssstik page HTTP ${pageRes.status}`);
       const html = await pageRes.text();
       const token = html.match(/s_tt\s*=\s*'([^']+)'/)?.[1] || html.match(/s_tt\s*=\s*"([^"]+)"/)?.[1];
@@ -931,10 +978,15 @@ async function downloadFileTo(
     }
     const file = fs.createWriteStream(filePath);
     let received = 0;
+    // Track whether we aborted the stream ourselves: calling end() on a
+    // destroyed stream rejects with ERR_STREAM_DESTROYED, which used to
+    // replace the real "Video too large" error with unreadable noise.
+    let aborted = false;
     try {
       for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) {
         received += chunk.length;
         if (received > maxBytes) {
+          aborted = true;
           file.destroy();
           try { fs.unlinkSync(filePath); } catch {}
           throw new Error(`❌ Video too large (>${config.maxFileSizeMB}MB). Try a shorter video.`);
@@ -943,9 +995,13 @@ async function downloadFileTo(
         if (total > 0 && onProgress) onProgress({ percent: (received / total) * 100 });
       }
     } finally {
-      await new Promise<void>((resolve, reject) => {
-        file.end((err?: Error | null) => (err ? reject(err) : resolve()));
-      });
+      if (aborted) {
+        try { file.destroy(); } catch {}
+      } else {
+        await new Promise<void>((resolve, reject) => {
+          file.end((err?: Error | null) => (err ? reject(err) : resolve()));
+        });
+      }
     }
   } catch (err: any) {
     try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch {}
@@ -1130,10 +1186,13 @@ export async function downloadVideo(
         console.log("📌 Pinterest video needs yt-dlp — cover image kept as fallback…");
         pinterestImageFallback = err.pinterestImageFallback;
       }
-      // Definitive failures (gone/private/too large): don't waste time on yt-dlp.
+      // Definitive failures (gone/private): don't waste time on yt-dlp.
+      // NOTE: "too large" is deliberately NOT definitive here — yt-dlp has a
+      // lower-quality ladder (and a 480p retry), so an over-limit direct pin
+      // download should still get a chance to come back smaller.
       if (err?.message?.startsWith("❌")) {
         const msg = String(err.message);
-        if (/not found|private|deleted|Could not find|too large/i.test(msg)) throw err;
+        if (/not found|private|deleted|Could not find/i.test(msg)) throw err;
       }
       console.warn(`⚠️ Pinterest direct failed, falling back to yt-dlp: ${(err?.message || String(err)).slice(0, 150)}`);
     }

@@ -1,4 +1,5 @@
-import { spawn, execSync } from "child_process";
+import { spawn, execFileSync } from "child_process";
+import type { ChildProcess } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
 import * as crypto from "crypto";
@@ -40,11 +41,19 @@ import type { DownloadProgress, DownloadResult } from "./downloader";
 
 const AUDIO_EXTENSIONS = new Set(["m4a", "mp3", "ogg", "opus", "wav", "aac", "flac", "wma"]);
 
+// All capability probes below must be bounded and shell-free. They run
+// synchronously on the bot's event loop (the attempt builders are sync), so a
+// hung binary would freeze EVERYTHING — Telegram updates, health checks, other
+// downloads. execFileSync with a hard timeout forces a kill; passing the
+// binary/args as separate argv entries (instead of execSync's interpolated
+// shell string) also removes shell parsing from values like YT_DLP_PATH.
+const PROBE_TIMEOUT_MS = 10000;
+
 let _hasNode: boolean | null = null;
 function hasNodeRuntime(): boolean {
   if (_hasNode === null) {
     try {
-      execSync("node --version", { stdio: "ignore" });
+      execFileSync("node", ["--version"], { stdio: "ignore", timeout: PROBE_TIMEOUT_MS, windowsHide: true });
       _hasNode = true;
     } catch {
       _hasNode = false;
@@ -61,7 +70,11 @@ function supportsImpersonate(): boolean {
       _impersonate = false;
     } else {
       try {
-        execSync(`"${bin}" --impersonate chrome --version`, { stdio: "ignore" });
+        execFileSync(bin, ["--impersonate", "chrome", "--version"], {
+          stdio: "ignore",
+          timeout: PROBE_TIMEOUT_MS,
+          windowsHide: true,
+        });
         _impersonate = true;
       } catch {
         _impersonate = false;
@@ -75,7 +88,7 @@ let _aria2c: boolean | null = null;
 function hasAria2c(): boolean {
   if (_aria2c === null) {
     try {
-      execSync("aria2c --version", { stdio: "ignore" });
+      execFileSync("aria2c", ["--version"], { stdio: "ignore", timeout: PROBE_TIMEOUT_MS, windowsHide: true });
       _aria2c = true;
     } catch {
       _aria2c = false;
@@ -101,7 +114,7 @@ function resolveYtDlpPath(): string {
   ];
   for (const c of candidates) {
     try {
-      execSync(`"${c}" --version`, { stdio: "ignore" });
+      execFileSync(c, ["--version"], { stdio: "ignore", timeout: PROBE_TIMEOUT_MS, windowsHide: true });
       _resolvedYtDlp = c;
       if (c !== config.ytDlpPath) console.log(`🔧 YouTube yt-dlp fallback: YT_DLP_PATH unusable, using binary at ${c}`);
       return _resolvedYtDlp;
@@ -127,7 +140,15 @@ export function hasUsableCookies(): boolean {
   if (config.cookiesContent) return true;
   try {
     const st = fs.statSync(config.cookiesPath);
-    return st.isFile() && st.size > 0;
+    if (!st.isFile() || st.size === 0) return false;
+    // "Non-empty" is not the same as "usable": the file only helps if it holds
+    // youtube.com cookies. An export from another site (or a truncated file)
+    // otherwise made the rotation spend its cookie-attempts on a source that
+    // cannot work, and suppressed the "no cookies installed" hint in the final
+    // error. Netscape cookie files are small; the read is capped so a huge or
+    // wrong file can never stall the event loop.
+    if (st.size > 4 * 1024 * 1024) return false;
+    return fs.readFileSync(config.cookiesPath, "utf8").includes("youtube.com");
   } catch {
     return false;
   }
@@ -157,7 +178,13 @@ async function fetchVisitorData(): Promise<string | null> {
       });
       if (res.ok) {
         const html = await res.text();
-        value = html.match(/"visitorData"\s*:\s*"([^"]+)"/)?.[1] || null;
+        const candidate = html.match(/"visitorData"\s*:\s*"([^"]+)"/)?.[1] || null;
+        // This value is spliced into one yt-dlp `--extractor-args` string, where
+        // ";" separates options and "," separates values. HTML is site-supplied
+        // data, so only keep characters a real visitorData value can contain;
+        // otherwise a weird/malicious page could inject extra extractor
+        // options into every attempt of this rotation.
+        value = candidate && /^[A-Za-z0-9_+/%=.-]{1,4096}$/.test(candidate) ? candidate : null;
       }
     } finally {
       clearTimeout(timeout);
@@ -313,6 +340,33 @@ function isBotCheck(msg: string): boolean {
 }
 
 /**
+ * Kill a child process AND every descendant. yt-dlp spawns helper processes of
+ * its own (ffmpeg for the DASH merge, aria2c for the parallel down-loader), so
+ * killing only the direct child on timeout leaves those grandchildren running:
+ * they keep the output files open and keep burning bandwidth/CPU, and they can
+ * corrupt the NEXT attempt of this same download (same output template).
+ * POSIX: the attempt is spawned detached, i.e. it leads its own process group —
+ * a negative PID kills the whole group. Windows has no signal-to-group, so
+ * `taskkill /T` walks the child tree instead. Always best-effort: the process
+ * may already be gone.
+ */
+function killProcessTree(proc: ChildProcess): void {
+  const pid = proc.pid;
+  if (!pid) return;
+  try {
+    if (process.platform === "win32") {
+      // windowsHide: never flash a console window on the bot's host.
+      const killer = spawn("taskkill", ["/pid", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
+      killer.on("error", () => {});
+      return;
+    }
+    process.kill(-pid, "SIGKILL");
+  } catch {
+    try { proc.kill("SIGKILL"); } catch {}
+  }
+}
+
+/**
  * Run one yt-dlp attempt with a hard timeout (free-tier safety: a stuck
  * client would otherwise hang the bot forever) and bounded output buffers
  * (memory safety: progress lines accumulate on long downloads).
@@ -324,28 +378,42 @@ function runYtDlpAttempt(
 ): Promise<string> {
   const MAX_BUF = 512 * 1024; // 512KB cap per stream
   return new Promise((resolve, reject) => {
-    const proc = spawn(resolveYtDlpPath(), args, { shell: false });
+    const proc = spawn(resolveYtDlpPath(), args, {
+      shell: false,
+      windowsHide: true,
+      // POSIX: own process group so a timeout can kill yt-dlp + ffmpeg/aria2c.
+      detached: process.platform !== "win32",
+    });
     let stdout = "";
     let stderr = "";
     let settled = false;
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
-      try { proc.kill("SIGKILL"); } catch {}
+      killProcessTree(proc);
       reject(new Error(`yt-dlp attempt timed out after ${Math.round(timeoutMs / 1000)}s (network stall or blocked client)`));
     }, timeoutMs);
     const append = (target: string, s: string): string => {
-      if (target.length >= MAX_BUF) return target;
+      // Keep the TAIL, not the head: the actionable lines (the final error, the
+      // "after_move" filepath) are the LAST thing yt-dlp writes. The old
+      // early-return stopped appending once the cap was hit, so those final
+      // lines were dropped exactly when output was long (a long download's
+      // progress spam) and the real failure cause was lost.
       const next = target + s;
       return next.length > MAX_BUF ? next.slice(-MAX_BUF) : next;
     };
     proc.stdout.on("data", (d: Buffer) => {
+      // After a timeout we already rejected and killed the tree: ignore late
+      // output so a dying attempt can't keep emitting stale progress into the
+      // NEXT attempt's user-facing message.
+      if (settled) return;
       const s = d.toString();
       stdout = append(stdout, s);
       const m = s.match(/(\d+\.\d+)%/);
       if (m && onProgress) onProgress({ percent: parseFloat(m[1]) });
     });
     proc.stderr.on("data", (d: Buffer) => {
+      if (settled) return;
       const s = d.toString();
       stderr = append(stderr, s);
       const m = s.match(/(\d+\.\d+)%/);
@@ -371,6 +439,12 @@ function resolveDownloadedFile(stdout: string, id: string): DownloadResult {
   const lines = stdout.trim().split("\n").map((l) => l.trim()).filter(Boolean);
   let filePath = lines.find((l) => l.endsWith(".mp4"));
   if (!filePath) filePath = lines[lines.length - 1];
+  // Never trust a path printed by an external tool: only accept a file this
+  // download wrote inside DOWNLOAD_DIR. Otherwise a crafted output line (or a
+  // future yt-dlp change) could make the bot read/upload an arbitrary local
+  // file. The fallback scans below are dir-scoped and don't need the check.
+  const downloadRoot = path.resolve(config.downloadDir) + path.sep;
+  if (filePath && !path.resolve(filePath).startsWith(downloadRoot)) filePath = undefined;
   if (!filePath || !fs.existsSync(filePath)) {
     const files = fs.readdirSync(config.downloadDir)
       .filter((f) => f.startsWith(id + "_") && f.endsWith(".mp4"))
@@ -397,7 +471,37 @@ function resolveDownloadedFile(stdout: string, id: string): DownloadResult {
     );
   }
   const stat = fs.statSync(filePath);
+  // --max-filesize is enforced by yt-dlp PER STREAM, so a DASH merge can still
+  // produce a file over the cap (video + audio each under the limit, sum over).
+  // Re-check the finished file: this throws the too-large marker so the caller's
+  // quality ladder retries lower instead of handing Telegram an over-limit file.
+  const maxBytes = config.maxFileSizeMB * 1024 * 1024;
+  if (stat.size > maxBytes) {
+    try { fs.unlinkSync(filePath); } catch {}
+    throw new Error(`❌ Video too large (>${config.maxFileSizeMB}MB even at the lowest quality). Try a shorter video.`);
+  }
   return { filePath, fileName: path.basename(filePath), ext, size: stat.size, platform: "youtube" };
+}
+
+/**
+ * Remove every file this download left behind in DOWNLOAD_DIR — partial
+ * `.part` fragments and split audio streams from timed-out/failed attempts —
+ * while keeping the file that is actually being returned. The prefix is a
+ * per-download random id, so concurrent downloads (each with its own id) are
+ * never touched. Without this, a failed video leaves a full-size partial file
+ * until the hourly cleanup (and the disk-budget guard may then delete OTHER
+ * users' finished downloads to make room).
+ */
+function cleanupDownloadFiles(id: string, keepPath?: string): void {
+  try {
+    const keep = keepPath ? path.resolve(keepPath) : null;
+    for (const f of fs.readdirSync(config.downloadDir)) {
+      if (!f.startsWith(id + "_")) continue;
+      const fp = path.join(config.downloadDir, f);
+      if (keep && path.resolve(fp) === keep) continue;
+      try { fs.unlinkSync(fp); } catch {}
+    }
+  } catch {}
 }
 
 export interface YtDlpSummary {
@@ -439,63 +543,78 @@ export async function downloadYouTubeViaYtDlp(
 
   const attempts = attemptsForYouTube();
   const summary: YtDlpSummary = { tried: 0, walled: 0 };
+  // Publish the fresh counters IMMEDIATELY: youtube.ts reads the module-level
+  // summary after a throw too, and a stale value from the PREVIOUS download
+  // would mis-classify this failure (e.g. claim it was bot-walled).
+  _lastSummary = summary;
   // Visitor data (for web clients' PO-token checks) is fetched once per
   // rotation, best-effort — null on walled/offline networks, which is fine.
   const visitorData = await fetchVisitorData();
   let lastError = "";
-  for (const attempt of attempts) {
-    summary.tried++;
-    // Quality ladder for this stack: start at the configured cap, step down
-    // when yt-dlp reports over --max-filesize (Telegram limit) instead of
-    // failing the video. Bounded to 2 extra heights so one stack can't
-    // triple the rotation time.
-    const baseHeight = config.youtubeMaxHeight > 0 ? config.youtubeMaxHeight : 720;
-    const heights = [baseHeight, ...lowerHeights(baseHeight)].slice(0, 3);
-    let stackDone = false;
-    for (const h of heights) {
-      const args = [
-        ...baseArgs,
-        ...buildYoutubeArgs(attempt.playerClients, formatForHeight(attempt.mobile, attempt.mobile ? 0 : h), attempt.useCookies, attempt.ipv4, visitorData),
-        "--print", "after_move:filepath",
-        url,
-      ];
-      try {
-        console.log(`⏳ YouTube yt-dlp attempt: ${attempt.name}${attempt.useCookies ? " (cookies)" : " (anonymous)"}${attempt.ipv4 ? "" : " (IPv6 route)"}${h !== baseHeight ? ` (retry ≤${h}p)` : ""}…`);
-        const stdout = await runYtDlpAttempt(args, onProgress);
-        const result = resolveDownloadedFile(stdout, id);
-        _lastSummary = summary;
-        console.log(`✅ YouTube yt-dlp saved via ${attempt.name}: ${result.fileName} (${(result.size / 1048576).toFixed(1)} MB)`);
-        return result;
-      } catch (err: any) {
-        lastError = err?.message || String(err);
-        if (lastError.startsWith("❌")) throw err; // definitive (audio-only)
-        if (isTooLargeOutput(lastError)) {
-          if (h !== heights[heights.length - 1]) {
-            console.log(`⚡ YouTube yt-dlp "${attempt.name}" over limit at ≤${h}p, trying lower quality…`);
-            continue; // next lower height, same stack
+  let saved: DownloadResult | null = null;
+  try {
+    for (const attempt of attempts) {
+      summary.tried++;
+      // Quality ladder for this stack: start at the configured cap, step down
+      // when yt-dlp reports over --max-filesize (Telegram limit) instead of
+      // failing the video. Bounded to 2 extra heights so one stack can't
+      // triple the rotation time.
+      // EXCEPT mobile stacks: their progressive itag-18 selector ignores the
+      // requested height (see formatForHeight), so a "lower height" retry
+      // would re-run the exact same command — two guaranteed-identical
+      // timeouts. Mobile stacks get one shot.
+      const baseHeight = config.youtubeMaxHeight > 0 ? config.youtubeMaxHeight : 720;
+      const heights = attempt.mobile ? [baseHeight] : [baseHeight, ...lowerHeights(baseHeight)].slice(0, 3);
+      let stackDone = false;
+      for (const h of heights) {
+        const args = [
+          ...baseArgs,
+          ...buildYoutubeArgs(attempt.playerClients, formatForHeight(attempt.mobile, attempt.mobile ? 0 : h), attempt.useCookies, attempt.ipv4, visitorData),
+          "--print", "after_move:filepath",
+          url,
+        ];
+        try {
+          console.log(`⏳ YouTube yt-dlp attempt: ${attempt.name}${attempt.useCookies ? " (cookies)" : " (anonymous)"}${attempt.ipv4 ? "" : " (IPv6 route)"}${h !== baseHeight ? ` (retry ≤${h}p)` : ""}…`);
+          const stdout = await runYtDlpAttempt(args, onProgress);
+          const result = resolveDownloadedFile(stdout, id);
+          saved = result;
+          console.log(`✅ YouTube yt-dlp saved via ${attempt.name}: ${result.fileName} (${(result.size / 1048576).toFixed(1)} MB)`);
+          return result;
+        } catch (err: any) {
+          lastError = err?.message || String(err);
+          // Size failures come FIRST: resolveDownloadedFile's post-merge check
+          // throws an ❌-prefixed "Video too large" error, and the generic
+          // "❌ = definitive" shortcut below would abort the ladder instead of
+          // retrying a lower height.
+          if (isTooLargeOutput(lastError)) {
+            if (h !== heights[heights.length - 1]) {
+              console.log(`⚡ YouTube yt-dlp "${attempt.name}" over limit at ≤${h}p, trying lower quality…`);
+              continue; // next lower height, same stack
+            }
+            throw new Error(`❌ Video too large (>${config.maxFileSizeMB}MB even at the lowest quality). Try a shorter video.`);
           }
-          _lastSummary = summary;
-          throw new Error(`❌ Video too large (>${config.maxFileSizeMB}MB even at the lowest quality). Try a shorter video.`);
-        }
-        if (isBotCheck(lastError)) summary.walled++;
-        console.warn(`⚠️ YouTube yt-dlp "${attempt.name}" failed: ${lastError.slice(0, 180)}`);
-        if (isFatalError(lastError)) {
-          _lastSummary = summary;
-          if (lastError.includes("Unsupported URL")) {
-            throw new Error("❌ Unsupported URL. Make sure the link is a public video.");
-          }
-          if (/Private video|This video is private|Video unavailable/.test(lastError)) {
+          if (lastError.startsWith("❌")) throw err; // definitive (audio-only)
+          if (isBotCheck(lastError)) summary.walled++;
+          console.warn(`⚠️ YouTube yt-dlp "${attempt.name}" failed: ${lastError.slice(0, 180)}`);
+          if (isFatalError(lastError)) {
+            if (lastError.includes("Unsupported URL")) {
+              throw new Error("❌ Unsupported URL. Make sure the link is a public video.");
+            }
             throw new Error("❌ Video unavailable or private.");
           }
-          throw new Error("❌ Video unavailable or private.");
+          stackDone = true;
+          break; // non-size failure → next stack (not next height)
         }
-        stackDone = true;
-        break; // non-size failure → next stack (not next height)
       }
+      if (stackDone) continue;
     }
-    if (stackDone) continue;
+    console.warn(`⚠️ All YouTube yt-dlp attempts failed (${summary.tried} tried, ${summary.walled} bot-walled). Last: ${lastError.slice(0, 150)}`);
+    return null;
+  } finally {
+    _lastSummary = summary;
+    // Temp-file hygiene: timed-out/killed attempts leave `.part` fragments and
+    // split audio streams behind, and the id prefix is unique to this download,
+    // so concurrent downloads are unaffected. Keep only the returned file.
+    cleanupDownloadFiles(id, saved?.filePath);
   }
-  _lastSummary = summary;
-  console.warn(`⚠️ All YouTube yt-dlp attempts failed (${summary.tried} tried, ${summary.walled} bot-walled). Last: ${lastError.slice(0, 150)}`);
-  return null;
 }

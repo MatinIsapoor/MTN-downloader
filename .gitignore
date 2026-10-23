@@ -3,9 +3,13 @@ dist
 downloads
 data
 .env
+.env.local
 *.db
 *.log
 *cookies*.txt
+cookies.txt.bak
+*.tmp
 ffmpeg.exe
 ffmpeg.zip
-"yt-dlp.exe" 
+yt-dlp.exe
+yt-dlp

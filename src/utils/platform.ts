@@ -19,11 +19,14 @@ export function detectPlatform(url: string): Platform {
   // pinterest.com.evil.com) must NOT match.
   try {
     const host = new URL(url.trim()).hostname.toLowerCase().replace(/^www\./, "").replace(/^m\./, "");
-    if (host === "youtu.be" || host.endsWith("youtube.com") || host.endsWith("youtube-nocookie.com")) return "youtube";
-    if (host.endsWith("tiktok.com") || host === "vm.tiktok.com" || host === "vt.tiktok.com") return "tiktok";
+    // `host === d || host.endsWith("." + d)` — a bare endsWith("youtube.com")
+    // also matches lookalikes such as "notyoutube.com" / "evilinstagram.com".
+    const on = (domain: string): boolean => host === domain || host.endsWith("." + domain);
+    if (host === "youtu.be" || on("youtube.com") || on("youtube-nocookie.com")) return "youtube";
+    if (on("tiktok.com")) return "tiktok";
     if (isPinItHost(host) || isPinterestHost(host)) return "pinterest";
-    if (host === "x.com" || host.endsWith("twitter.com") || host === "t.co") return "twitter";
-    if (host.endsWith("instagram.com") || host === "instagr.am") return "instagram";
+    if (host === "x.com" || on("twitter.com") || host === "t.co") return "twitter";
+    if (on("instagram.com") || host === "instagr.am") return "instagram";
     return "unknown";
   } catch {}
   // Fallback for malformed URLs (no parseable hostname): substring scan

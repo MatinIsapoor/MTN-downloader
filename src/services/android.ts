@@ -1,8 +1,9 @@
 import * as fs from "fs";
 import * as path from "path";
 import * as crypto from "crypto";
+import { once } from "events";
 import { config } from "../config";
-import { extractYouTubeId } from "./invidious";
+import { extractYouTubeId, readBodyCapped, assertSafeMediaUrl } from "./invidious";
 import { TooLargeError } from "./quality";
 import type { DownloadProgress, DownloadResult } from "./downloader";
 
@@ -163,6 +164,8 @@ async function streamToFile(
   userAgent: string,
   onProgress?: (p: DownloadProgress) => void
 ): Promise<void> {
+  // SSRF guard: never fetch a non-public host from a provider payload.
+  assertSafeMediaUrl(fileUrl);
   const maxBytes = config.maxFileSizeMB * 1024 * 1024;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 180000);
@@ -171,33 +174,77 @@ async function streamToFile(
       headers: { "User-Agent": userAgent },
       signal: controller.signal,
     });
-    if (!res.ok || !res.body) throw new Error(`Video server HTTP ${res.status}`);
+    const body = res.body;
+    if (!res.ok || !body) {
+      // Release the socket for a body we are not going to read.
+      try {
+        await body?.cancel();
+      } catch {}
+      throw new Error(`Video server HTTP ${res.status}`);
+    }
     const total = Number(res.headers.get("content-length") || 0);
     if (total > maxBytes) {
+      try {
+        await body.cancel();
+      } catch {}
       throw new TooLargeError(`❌ This quality is over ${config.maxFileSizeMB}MB — trying a lower quality…`);
     }
     const file = fs.createWriteStream(filePath);
+    // A write-side failure (disk full, permissions) is emitted as an 'error'
+    // event. With no listener Node turns it into an uncaught exception and
+    // kills the whole bot — and the drain wait below would never settle.
+    let writeError: Error | null = null;
+    file.on("error", (err) => {
+      writeError = writeError || err;
+    });
     let received = 0;
+    let tooLarge = false;
     try {
-      for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) {
+      for await (const chunk of body as unknown as AsyncIterable<Uint8Array>) {
         received += chunk.length;
         if (received > maxBytes) {
-          file.destroy();
-          try { fs.unlinkSync(filePath); } catch {}
-          throw new TooLargeError(`❌ This quality is over ${config.maxFileSizeMB}MB — trying a lower quality…`);
+          // Do NOT destroy() here: end() on a destroyed stream rejects with
+          // ERR_STREAM_DESTROYED, which REPLACES this TooLargeError and makes
+          // the caller treat "retry a lower rendition" as a provider failure.
+          // Stop reading, close the file cleanly, delete it below.
+          tooLarge = true;
+          break;
         }
-        if (!file.write(chunk)) await new Promise<void>((r) => file.once("drain", r));
+        if (!file.write(chunk)) {
+          // No 'drain' will ever arrive on an already-failed stream — fail
+          // fast instead of hanging. events.once() covers a failure that
+          // happens while waiting, so this wait always settles.
+          if (writeError) throw writeError;
+          await once(file, "drain");
+        }
         if (total > 0 && onProgress) onProgress({ percent: (received / total) * 100 });
       }
     } finally {
-      await new Promise<void>((resolve, reject) => {
-        file.end((err?: Error | null) => (err ? reject(err) : resolve()));
+      // Close (or finish closing) unconditionally so no half-open handle or
+      // partial file is left behind, and never let this throw: it would mask
+      // the real error that sent us here.
+      await new Promise<void>((resolve) => {
+        file.end((err?: Error | null) => {
+          if (err) writeError = writeError || err;
+          resolve();
+        });
       });
     }
+    if (writeError) throw writeError;
+    if (tooLarge) {
+      try {
+        fs.unlinkSync(filePath);
+      } catch {}
+      throw new TooLargeError(`❌ This quality is over ${config.maxFileSizeMB}MB — trying a lower quality…`);
+    }
   } catch (err: any) {
-    try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch {}
+    try {
+      if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    } catch {}
     if (err instanceof TooLargeError) throw err;
-    if (err?.name === "AbortError") throw new Error("❌ Download timed out. Please try again.");
+    // NOTE: no ❌ prefix — the caller treats ❌ as a definitive verdict on the
+    // video; a slow/aborted media host is only this client's stream failing.
+    if (err?.name === "AbortError") throw new Error("Download timed out (video server too slow or blocked).");
     throw err instanceof Error ? err : new Error(`❌ Download failed: ${err}`);
   } finally {
     clearTimeout(timeout);
@@ -251,8 +298,16 @@ export async function downloadYouTubeViaAndroid(
         }),
         signal: controller.signal,
       });
-      if (!res.ok) throw new Error(`youtubei HTTP ${res.status}`);
-      data = (await res.json()) as YoutubeiResponse;
+      if (!res.ok) {
+        // Release the socket for a body we are not going to read.
+        try {
+          await res.body?.cancel();
+        } catch {}
+        throw new Error(`youtubei HTTP ${res.status}`);
+      }
+      // Cap the player response before parsing: it is remote input, and a
+      // broken/oversized body must not be buffered whole into this small host.
+      data = JSON.parse(await readBodyCapped(res, 4 * 1024 * 1024)) as YoutubeiResponse;
     } catch (err: any) {
       clearTimeout(timeout);
       const msg = err?.name === "AbortError" ? "timed out" : (err?.message || String(err));
@@ -290,6 +345,11 @@ export async function downloadYouTubeViaAndroid(
     // Walk renditions best-first so an over-limit file retries lower quality
     // on the same client before moving to the next client identity.
     let saved: DownloadResult | null = null;
+    // Set when THIS client's stream URL failed (expired/403/CDN reset). A
+    // stream failure says nothing about the other player clients, so it must
+    // not abort the rotation — rotating clients is exactly what this method
+    // is for.
+    let streamFailed = false;
     for (const chosen of ranked) {
       if (!chosen?.url) continue;
       console.log(`⚡ Youtubei ${client.name}: "${title.slice(0, 60)}" -> itag ${chosen.itag} (${chosen.height || "?"}p) progressive MP4`);
@@ -302,18 +362,29 @@ export async function downloadYouTubeViaAndroid(
           console.log(`⚡ Youtubei ${client.name}: ${chosen.height || "?"}p over limit, trying lower quality…`);
           continue;
         }
-        throw err;
+        console.warn(`⚠️ Youtubei ${client.name}: ${videoId} stream failed: ${String(err?.message || err).slice(0, 110)}`);
+        failures.push(`${client.name}: stream failed`);
+        streamFailed = true;
+        break;
       }
       const stat = fs.statSync(filePath);
       if (stat.size === 0) {
-        try { fs.unlinkSync(filePath); } catch {}
-        throw new Error("empty file");
+        try {
+          fs.unlinkSync(filePath);
+        } catch {}
+        console.warn(`⚠️ Youtubei ${client.name}: ${videoId} saved an empty file — trying next client…`);
+        failures.push(`${client.name}: empty file`);
+        streamFailed = true;
+        break;
       }
       console.log(`✅ Youtubei ${client.name} saved: ${fileName} (${(stat.size / 1048576).toFixed(1)} MB)`);
       saved = { filePath, fileName, title, ext: "mp4", size: stat.size, platform: "youtube" };
       break;
     }
     if (saved) return saved;
+    if (streamFailed) continue;
+    // Every rendition on this client overflowed the Telegram limit — the cap
+    // is the same for every client, so this is definitive for the video.
     throw new Error(`❌ Video too large (>${config.maxFileSizeMB}MB even at the lowest quality). Try a shorter video.`);
   }
 

@@ -25,6 +25,17 @@ async function main() {
   await initDatabase();
   console.log("✅ Database initialized");
 
+  // Render's free plan has an EPHEMERAL filesystem and no persistent disks:
+  // ./data/bot.db is wiped on every restart/redeploy, so users, stats and
+  // history silently reset. Say so loudly instead of letting the admin wonder
+  // why the user table is empty again.
+  if (process.env.RENDER || process.env.RENDER_EXTERNAL_URL) {
+    console.warn(
+      `⚠️ Render detected: ${config.databasePath} is on an ephemeral disk — user stats/download history reset on every restart/redeploy. ` +
+        "Render's free plan cannot attach a persistent disk; move the bot to a host with persistent storage (or a paid Render disk) if history must survive."
+    );
+  }
+
   // Downloader health: yt-dlp version, cookies, JS runtime, fallbacks
   // Restore cookies.txt from COOKIES_CONTENT first (Render-safe persistence).
   ensureCookiesFromEnv();
@@ -39,10 +50,11 @@ async function main() {
   // Global middleware
   bot.use(userMiddleware);
 
-  // Register handlers
-  registerUserHandlers(bot);
-  registerAdminHandlers(bot);
-
+  // Admin text interception MUST be registered before the user handlers:
+  // Telegraf runs handlers in registration order, and the user handler would
+  // otherwise consume an admin's search/broadcast text that happens to contain
+  // a link (and start downloading it).
+  //
   // Handle admin find-user trigger: intercept /find command
   bot.command("find", (ctx) => {
     if (!isAdmin(ctx.from.id)) return;
@@ -80,6 +92,10 @@ async function main() {
 
     return next();
   });
+
+  // Register handlers (after the admin interception above)
+  registerUserHandlers(bot);
+  registerAdminHandlers(bot);
 
   // Error handler
   bot.catch((err, ctx) => {

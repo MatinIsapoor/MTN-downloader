@@ -20,7 +20,7 @@ export function registerUserHandlers(bot: Telegraf<Context>): void {
         `🐦 X / Twitter\n` +
         `📸 Instagram (Reels, Posts, Stories if public)\n` +
         `📌 Pinterest (video & image pins, incl. pin.it links)\n\n` +
-        `Just paste the URL and I'll send you the video *plus its music* 🎬🎵\n\n` +
+        `Just paste the URL and I'll send you the video plus its music 🎬🎵\n\n` +
         `Commands:\n` +
         `/start - Show this message\n` +
         `/help - How to use\n` +
@@ -79,7 +79,7 @@ export function registerUserHandlers(bot: Telegraf<Context>): void {
       const date = new Date(d.created_at).toLocaleDateString();
       return `${i + 1}. ${platformEmoji(d.platform)} ${d.platform || "?" } [${d.status}] ${date}\n   ${d.url.slice(0, 60)}`;
     });
-    await ctx.reply(`📜 *Your last ${downloads.length} downloads:*\n\n` + lines.join("\n\n"));
+    await ctx.reply(`📜 Your last ${downloads.length} downloads:\n\n` + lines.join("\n\n"));
   });
 
   bot.action("user_stats", async (ctx) => {
@@ -137,6 +137,18 @@ export function registerUserHandlers(bot: Telegraf<Context>): void {
     let statusMsg: any;
     // Track files so both video + extracted music are always cleaned up.
     const tempFiles: string[] = [];
+    // The global download slot + the temp file are tied to the DOWNLOAD
+    // promise, not to this handler. When the overall timeout fires we stop
+    // waiting, but yt-dlp (or a provider pipeline) may still be running: it
+    // must not hand its slot to a new download while its children are alive
+    // (OOM on a 512MB free-tier instance) and the file it eventually writes
+    // has to be deleted too.
+    let slotReleased = false;
+    const releaseSlot = (): void => {
+      if (slotReleased) return;
+      slotReleased = true;
+      releaseDownloadSlot();
+    };
     try {
       statusMsg = await ctx.reply(`${platformEmoji(platform)} Downloading from *${platform}*… Please wait…`, {
         parse_mode: "Markdown",
@@ -144,26 +156,43 @@ export function registerUserHandlers(bot: Telegraf<Context>): void {
 
       // Optional: edit message on progress (throttled)
       let lastEdit = 0;
-      const result = await withTimeout(
-        downloadVideo(url, (p) => {
-          const now = Date.now();
-          if (now - lastEdit < 2000) return;
-          lastEdit = now;
-          if (p.percent) {
-            ctx.telegram
-              .editMessageText(
-                ctx.chat.id,
-                statusMsg.message_id,
-                undefined,
-                `${platformEmoji(platform)} Downloading… ${p.percent.toFixed(1)}%`
-              )
-              .catch(() => {});
-          }
-        }),
-        config.downloadTimeoutMs,
-        "Download"
-      );
+      let consumed = false;
+      const downloadPromise = downloadVideo(url, (p) => {
+        const now = Date.now();
+        if (now - lastEdit < 2000) return;
+        lastEdit = now;
+        if (p.percent) {
+          ctx.telegram
+            .editMessageText(
+              ctx.chat.id,
+              statusMsg.message_id,
+              undefined,
+              `${platformEmoji(platform)} Downloading… ${p.percent.toFixed(1)}%`
+            )
+            .catch(() => {});
+        }
+      });
+      downloadPromise
+        .then((r) => {
+          // Nobody is waiting for it any more (timeout already reported).
+          if (!consumed) cleanupFile(r.filePath);
+        })
+        .catch(() => {})
+        .finally(releaseSlot);
+
+      const result = await withTimeout(downloadPromise, config.downloadTimeoutMs, "Download");
+      consumed = true;
       tempFiles.push(result.filePath);
+
+      // Telegram's cloud Bot API rejects files above 50MB, so a download that
+      // fits MAX_FILE_SIZE_MB can still fail at upload with an opaque error.
+      const uploadLimitMB = config.telegramUploadLimitMB;
+      if (uploadLimitMB > 0 && result.size > uploadLimitMB * 1024 * 1024) {
+        throw new Error(
+          `❌ The video is ${formatBytes(result.size)}, but Telegram's Bot API only accepts uploads up to ${uploadLimitMB}MB.\n\n` +
+            `Lower MAX_FILE_SIZE_MB to ${uploadLimitMB} or less, or use a local Bot API server (then set TELEGRAM_UPLOAD_LIMIT_MB=0).`
+        );
+      }
 
       // Check file size vs Telegram limit (50MB for bots via sendVideo, but 2000MB with local API)
       // We'll attempt to send; if too large, inform user
@@ -239,7 +268,9 @@ export function registerUserHandlers(bot: Telegraf<Context>): void {
     } finally {
       for (const f of tempFiles) cleanupFile(f);
       processing.delete(userId);
-      releaseDownloadSlot();
+      // Idempotent: releases immediately on the normal path, or right after a
+      // timed-out download finally settles (see releaseSlot above).
+      releaseSlot();
     }
   });
 }

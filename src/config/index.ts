@@ -21,7 +21,22 @@ export const config = {
   ffmpegDir: process.env.FFMPEG_PATH
     ? path.resolve(path.dirname(process.env.FFMPEG_PATH))
     : path.resolve("."),
-  maxFileSizeMB: Number(process.env.MAX_FILE_SIZE_MB || 50),
+  // Guard against a typo'd env var (Number("50MB") = NaN) silently disabling
+  // the size cap: any non-positive/non-finite value falls back to 50MB.
+  maxFileSizeMB: (() => {
+    const n = Number(process.env.MAX_FILE_SIZE_MB ?? 50);
+    return Number.isFinite(n) && n > 0 ? n : 50;
+  })(),
+  // Telegram Bot API (cloud) refuses sendVideo above 50MB, so a file that
+  // downloads fine under MAX_FILE_SIZE_MB can still fail at the upload step
+  // with an opaque "Request Entity Too Large". Check up front and explain.
+  // Set TELEGRAM_UPLOAD_LIMIT_MB=0 for a local Bot API server (up to 2GB).
+  telegramUploadLimitMB: (() => {
+    const raw = (process.env.TELEGRAM_UPLOAD_LIMIT_MB ?? "").trim();
+    if (raw === "") return 50;
+    const n = Number(raw);
+    return Number.isFinite(n) && n >= 0 ? n : 50;
+  })(),
   downloadDir: path.resolve(process.env.DOWNLOAD_DIR || "./downloads"),
   databasePath: path.resolve(process.env.DATABASE_PATH || "./data/bot.db"),
   // YouTube bot-check bypass: cookies from a logged-in browser.
@@ -38,6 +53,13 @@ export const config = {
   // TikTok fallback: when yt-dlp fails (IP blocks / API changes),
   // resolve the video through a third-party API and download the mp4 directly.
   tiktokFallback: (process.env.TIKTOK_FALLBACK || "true").toLowerCase() !== "false",
+  // Pinterest MP4 normalization does a FULL ffmpeg re-encode (it is the only
+  // reliable fix for Pinterest's edit-list/HEVC files that play black in
+  // Telegram's mobile players). On a 0.1-CPU free tier that re-encode of a
+  // one-minute clip can take several minutes and blow the download budget, so
+  // it can be disabled there: the original file is sent instead (plays fine on
+  // most players, may show black video + audio on strict ones).
+  pinterestNormalize: (process.env.PINTEREST_NORMALIZE || "true").toLowerCase() !== "false",
   // YouTube without cookies: "auto" (default) tries anonymous player clients
   // (android/mweb/web_safari/web_embedded, no login) FIRST and only uses cookies as a
   // fallback for age-gated/private/rate-limited videos. Most public videos
@@ -56,6 +78,10 @@ export const config = {
   // residential proxy is the only fix when the IP itself is flagged.
   // Example: YT_DLP_PROXY=http://user:pass@host:port
   ytDlpProxy: (process.env.YT_DLP_PROXY || "").trim(),
+  // TLS certificate verification for yt-dlp is ON by default. A few CDNs ship
+  // broken certificate chains, so there is an escape hatch — but passing
+  // --no-check-certificates also silences real MITM errors, so it is opt-in.
+  ytDlpInsecureTls: (process.env.YT_DLP_INSECURE_TLS || "").trim().toLowerCase() === "true",
   // --- Alternative (non-yt-dlp) download methods ---------------------------
   // Invidious: fast YouTube path that bypasses yt-dlp entirely. A public
   // Invidious instance resolves the progressive MP4 and we download it with

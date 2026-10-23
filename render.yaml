@@ -40,7 +40,14 @@ services:
         value: true
       # Self-ping interval (min). Stays under Render's ~15 min idle spin-down.
       - key: KEEPALIVE_INTERVAL_MINUTES
-        value: 10
+        value: "10"
+      # Pinterest MP4 normalization is a FULL ffmpeg re-encode (fixes black
+      # video in Telegram's mobile player). On the free plan (0.1 CPU) a
+      # one-minute clip takes minutes of CPU and eats the download budget, so
+      # it is disabled here: the original Pinterest MP4 is sent as-is. Set to
+      # "true" on a paid plan or if Pinterest videos show black frames.
+      - key: PINTEREST_NORMALIZE
+        value: "false"
       # Stability on the free plan (all optional — defaults are safe):
       # max simultaneous downloads (each spawns yt-dlp/ffmpeg children).
       # - key: MAX_CONCURRENT_DOWNLOADS

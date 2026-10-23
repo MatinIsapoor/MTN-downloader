@@ -32,7 +32,12 @@ let _ffmpegVersion: string | null | undefined;
 export function getFfmpegVersion(): string | null {
   if (_ffmpegVersion !== undefined) return _ffmpegVersion;
   try {
-    const out = execSync(`"${getFfmpegBinary()}" -version`, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    const out = execSync(`"${getFfmpegBinary()}" -version`, {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 20000,
+      windowsHide: true,
+    });
     _ffmpegVersion = out.split("\n")[0].replace(/^ffmpeg version\s+/, "").split(/\s+/)[0] || "unknown";
   } catch {
     _ffmpegVersion = null;
@@ -45,7 +50,12 @@ let _hasLibx264: boolean | null = null;
 export function hasLibx264(): boolean {
   if (_hasLibx264 !== null) return _hasLibx264;
   try {
-    const out = execSync(`"${getFfmpegBinary()}" -hide_banner -encoders`, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    const out = execSync(`"${getFfmpegBinary()}" -hide_banner -encoders`, {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 20000,
+      windowsHide: true,
+    });
     _hasLibx264 = /(^|\s)libx264(\s|$)/m.test(out);
   } catch {
     _hasLibx264 = false;
@@ -77,7 +87,13 @@ export function probeMedia(filePath: string): MediaProbe | null {
   };
   try {
     if (!fs.existsSync(filePath) || fs.statSync(filePath).size === 0) return { ...empty };
-    const r = spawnSync(getFfmpegBinary(), ["-hide_banner", "-i", filePath], { encoding: "utf8" });
+    // Bounded: ffmpeg on a corrupt/HLS-page file can hang parsing headers, and
+    // spawnSync blocks the WHOLE event loop (Telegram updates, health checks).
+    const r = spawnSync(getFfmpegBinary(), ["-hide_banner", "-i", filePath], {
+      encoding: "utf8",
+      timeout: 30000,
+      windowsHide: true,
+    });
     if (r.error) return null;
     const out = String(r.stderr || "") + "\n" + String(r.stdout || "");
     if (/moov atom not found|Invalid data found|Unable to find a suitable/i.test(out)) {
@@ -154,6 +170,9 @@ function runFfmpeg(args: string[], timeoutMs: number): Promise<void> {
  *   3. original file
  */
 export async function normalizePinterestMp4(result: DownloadResult): Promise<DownloadResult> {
+  // Free-tier hosts (Render 0.1 CPU) can spend minutes on a single re-encode;
+  // PINTEREST_NORMALIZE=false sends the original MP4 untouched instead.
+  if (!config.pinterestNormalize) return result;
   if (getFfmpegVersion() === null) return result;
   const probe = probeMedia(result.filePath);
   const inDesc = probe && probe.hasVideo
@@ -243,7 +262,13 @@ export async function normalizePinterestMp4(result: DownloadResult): Promise<Dow
  */
 function decodeVerifies(filePath: string): boolean {
   try {
-    const r = spawnSync(getFfmpegBinary(), ["-v", "error", "-i", filePath, "-f", "null", "-"], { encoding: "utf8" });
+    // Full decode of a long video takes a while, but it must stay bounded: a
+    // file that makes ffmpeg loop forever would freeze the event loop.
+    const r = spawnSync(getFfmpegBinary(), ["-v", "error", "-i", filePath, "-f", "null", "-"], {
+      encoding: "utf8",
+      timeout: 300000,
+      windowsHide: true,
+    });
     if (r.error) return false;
     // Any decode error/warning on stderr means a damaged stream.
     return String(r.stderr || "").trim().length === 0;

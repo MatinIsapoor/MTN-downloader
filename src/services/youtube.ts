@@ -1,7 +1,7 @@
 import { config } from "../config";
 import { downloadViaCobalt, isCobaltConfigured } from "./cobalt";
 import { downloadYouTubeViaInvidious, extractYouTubeId } from "./invidious";
-import { downloadYouTubeViaPiped, getLastPipedSummary } from "./piped";
+import { downloadYouTubeViaPiped, getLastPipedSummary, type PipedSummary } from "./piped";
 import { downloadYouTubeViaAndroid } from "./android";
 import { downloadYouTubeViaYtDlp, getLastYtDlpSummary, hasUsableCookies, ytDlpFallbackStatus } from "./youtubeYtdlp";
 import type { DownloadProgress, DownloadResult } from "./downloader";
@@ -82,14 +82,21 @@ export async function downloadYouTubeCookieFree(
   }
 
   // --- 4) Piped (public path, mostly dead in 2026 — last resorts) ---------
+  // Snapshot the classified failure counts for THIS run: getLastPipedSummary()
+  // reads module-level state, so using it later at buildYouTubeError() time
+  // would report a stale verdict from a previous download whenever Piped was
+  // disabled/skipped (or a concurrent download overwrote it).
+  let pipedSummary: PipedSummary | null = null;
   if (config.pipedEnabled) {
     try {
       console.log("⚡ YouTube: trying Piped…");
       const fast = await downloadYouTubeViaPiped(url, onProgress);
+      pipedSummary = getLastPipedSummary();
       if (fast) return fast;
       console.log("⚡ YouTube: Piped unavailable for this video, trying Invidious…");
     } catch (err: any) {
       if (err?.message?.startsWith("❌")) throw err;
+      pipedSummary = getLastPipedSummary();
       console.warn(`⚠️ YouTube Piped failed, trying Invidious: ${(err?.message || String(err)).slice(0, 150)}`);
     }
   }
@@ -113,7 +120,7 @@ export async function downloadYouTubeCookieFree(
     ytdlpWalled = last.walled;
   }
 
-  throw buildYouTubeError(androidWalled, ytdlpWalled);
+  throw buildYouTubeError(androidWalled, ytdlpWalled, pipedSummary);
 }
 
 /**
@@ -146,8 +153,16 @@ async function tryYtDlp(
  * using Piped's classified failure counts, so the user gets actionable
  * advice instead of a generic "unreachable".
  */
-function buildYouTubeError(androidWalled = false, ytdlpWalled = false): Error {
-  const s = getLastPipedSummary();
+function buildYouTubeError(
+  androidWalled = false,
+  ytdlpWalled = false,
+  pipedSummary: PipedSummary | null = null
+): Error {
+  // Only trust Piped's counts when Piped actually ran for THIS download: the
+  // getLastPipedSummary() module state can belong to an older (or concurrent)
+  // request, which mislabelled an "everything failed" error as "video gone".
+  const s: PipedSummary =
+    pipedSummary || { tried: 0, botWalled: 0, notFound: 0, unreachable: 0, other: 0 };
   // Extra admin hint when the final fallback couldn't even run — otherwise
   // the message looks identical to the pre-fallback era and hides the fix.
   const ytdlpStatus = ytDlpFallbackStatus();
