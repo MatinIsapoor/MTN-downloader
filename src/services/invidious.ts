@@ -2,6 +2,7 @@ import * as fs from "fs";
 import * as path from "path";
 import * as crypto from "crypto";
 import { config } from "../config";
+import { TooLargeError } from "./quality";
 import type { DownloadProgress, DownloadResult } from "./downloader";
 
 const UA =
@@ -83,25 +84,29 @@ export function pickFormat(
   formats: InvidiousFormat[],
   maxHeight: number
 ): InvidiousFormat | null {
+  return pickFormatsSorted(formats, maxHeight)[0] || null;
+}
+
+/**
+ * All progressive MP4s sorted best-first (at/under cap first, then smaller
+ * fallbacks). Walked in order so an over-limit rendition retries lower.
+ */
+export function pickFormatsSorted(
+  formats: InvidiousFormat[],
+  maxHeight: number
+): InvidiousFormat[] {
   const mp4s = formats.filter(isMp4Progressive);
-  if (mp4s.length === 0) return null;
+  if (mp4s.length === 0) return [];
   const withHeight = mp4s.map((f) => ({ f, h: parseHeight(f) }));
+  const known = withHeight.filter((x) => x.h > 0).sort((a, b) => b.h - a.h);
+  const unknown = withHeight.filter((x) => x.h <= 0).map((x) => x.f);
   if (maxHeight > 0) {
-    const fitting = withHeight.filter((x) => x.h > 0 && x.h <= maxHeight);
-    if (fitting.length > 0) {
-      fitting.sort((a, b) => b.h - a.h);
-      return fitting[0].f;
-    }
-    // Nothing fits the cap (all higher): take the smallest available so the
-    // file still fits Telegram limits instead of grabbing 1080p+.
-    const known = withHeight.filter((x) => x.h > 0).sort((a, b) => a.h - b.h);
-    if (known.length > 0) return known[0].f;
-  } else {
-    const known = withHeight.filter((x) => x.h > 0).sort((a, b) => b.h - a.h);
-    if (known.length > 0) return known[0].f;
+    const fitting = known.filter((x) => x.h <= maxHeight).map((x) => x.f);
+    const smaller = known.filter((x) => x.h > maxHeight).sort((a, b) => a.h - b.h).map((x) => x.f);
+    if (fitting.length > 0) return [...fitting, ...unknown, ...smaller];
+    return [...known.sort((a, b) => a.h - b.h).map((x) => x.f), ...unknown];
   }
-  // No height info at all — just take the first mp4.
-  return mp4s[0];
+  return [...known.map((x) => x.f), ...unknown];
 }
 
 async function fetchJsonWithTimeout(url: string, timeoutMs: number): Promise<any> {
@@ -181,7 +186,7 @@ async function streamToFile(
     if (!res.ok || !res.body) throw new Error(`Video server HTTP ${res.status}`);
     const total = Number(res.headers.get("content-length") || 0);
     if (total > maxBytes) {
-      throw new Error(`❌ Video too large (>${config.maxFileSizeMB}MB). Try a shorter video.`);
+      throw new TooLargeError(`❌ This quality is over ${config.maxFileSizeMB}MB — trying a lower quality…`);
     }
     const file = fs.createWriteStream(filePath);
     let received = 0;
@@ -193,7 +198,7 @@ async function streamToFile(
           try {
             fs.unlinkSync(filePath);
           } catch {}
-          throw new Error(`❌ Video too large (>${config.maxFileSizeMB}MB). Try a shorter video.`);
+          throw new TooLargeError(`❌ This quality is over ${config.maxFileSizeMB}MB — trying a lower quality…`);
         }
         if (!file.write(chunk)) await new Promise<void>((r) => file.once("drain", r));
         if (total > 0 && onProgress) onProgress({ percent: (received / total) * 100 });
@@ -208,6 +213,7 @@ async function streamToFile(
     try {
       if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
     } catch {}
+    if (err instanceof TooLargeError) throw err;
     if (err?.name === "AbortError") throw new Error("❌ Download timed out. Please try again.");
     throw err instanceof Error ? err : new Error(`❌ Download failed: ${err}`);
   } finally {
@@ -236,14 +242,17 @@ export async function downloadYouTubeViaInvidious(
   const videoId = extractYouTubeId(url);
   if (!videoId) return null;
 
-  const instances = await resolveInstances();
+  // Cap the rotation: most public instances disabled their API (HTTP 403).
+  // First 8 keeps the fallback quick instead of stalling on dead hosts.
+  const allInstances = await resolveInstances();
+  const instances = allInstances.slice(0, 8);
   const failures: string[] = [];
   let apiDisabledCount = 0;
   for (const instance of instances) {
     try {
       const data = await fetchJsonWithTimeout(
         `${instance}/api/v1/videos/${videoId}`,
-        15000
+        config.publicApiTimeoutMs
       );
       if (data?.error) throw new Error(String(data.error).slice(0, 120));
       const title: string | undefined = data?.title;
@@ -251,36 +260,52 @@ export async function downloadYouTubeViaInvidious(
       if (!Array.isArray(formats) || formats.length === 0) {
         throw new Error("no progressive streams (login-walled or gone?)");
       }
-      const chosen = pickFormat(formats, config.youtubeMaxHeight);
-      if (!chosen?.url) throw new Error("no mp4 stream available");
-      const height = parseHeight(chosen);
-      console.log(
-        `⚡ Invidious ${instance}: "${(title || videoId).slice(0, 60)}" ` +
-          `-> ${chosen.qualityLabel || height + "p" || "mp4"} progressive MP4`
-      );
+      const ranked = pickFormatsSorted(formats, config.youtubeMaxHeight);
+      if (ranked.length === 0 || !ranked[0]?.url) throw new Error("no mp4 stream available");
 
-      const id = crypto.randomBytes(6).toString("hex");
-      const fileName = `${id}_${sanitizeFileName(title || videoId)}.mp4`;
-      const filePath = path.join(config.downloadDir, fileName);
       if (!fs.existsSync(config.downloadDir)) fs.mkdirSync(config.downloadDir, { recursive: true });
+      const id = crypto.randomBytes(6).toString("hex");
 
-      await streamToFile(chosen.url, filePath, `${instance}/`, onProgress);
-      const stat = fs.statSync(filePath);
-      if (stat.size === 0) {
+      // Walk renditions best-first: over-limit files retry lower quality.
+      let completed: DownloadResult | null = null;
+      for (const chosen of ranked) {
+        if (!chosen?.url) continue;
+        const height = parseHeight(chosen);
+        console.log(
+          `⚡ Invidious ${instance}: "${(title || videoId).slice(0, 60)}" ` +
+            `-> ${chosen.qualityLabel || height + "p" || "mp4"} progressive MP4`
+        );
+        const fileName = `${id}_${sanitizeFileName(title || videoId)}.mp4`;
+        const filePath = path.join(config.downloadDir, fileName);
         try {
-          fs.unlinkSync(filePath);
-        } catch {}
-        throw new Error("empty file");
+          await streamToFile(chosen.url, filePath, `${instance}/`, onProgress);
+        } catch (err: any) {
+          if (err instanceof TooLargeError) {
+            console.log(`⚡ Invidious ${instance}: ${height || "?"}p over limit, trying lower quality…`);
+            continue;
+          }
+          throw err;
+        }
+        const stat = fs.statSync(filePath);
+        if (stat.size === 0) {
+          try {
+            fs.unlinkSync(filePath);
+          } catch {}
+          throw new Error("empty file");
+        }
+        console.log(`✅ Invidious saved: ${fileName} (${(stat.size / 1048576).toFixed(1)} MB)`);
+        completed = {
+          filePath,
+          fileName,
+          title,
+          ext: "mp4",
+          size: stat.size,
+          platform: "youtube",
+        };
+        break;
       }
-      console.log(`✅ Invidious saved: ${fileName} (${(stat.size / 1048576).toFixed(1)} MB)`);
-      return {
-        filePath,
-        fileName,
-        title,
-        ext: "mp4",
-        size: stat.size,
-        platform: "youtube",
-      };
+      if (completed) return completed;
+      throw new Error(`❌ Video too large (>${config.maxFileSizeMB}MB even at the lowest quality). Try a shorter video.`);
     } catch (err: any) {
       const msg = err?.message || String(err);
       // Definitive failures: don't burn through every instance.

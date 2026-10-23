@@ -36,12 +36,21 @@ function adminMenuKeyboard() {
 
 function cookiesStatusText(): string {
   const s = getCookiesStatus();
+  const freshness =
+    s.sessionDaysLeft === null
+      ? s.expiryText
+      : s.sessionDaysLeft < 0
+        ? `❌ EXPIRED ${-s.sessionDaysLeft}d ago — refresh now`
+        : s.sessionDaysLeft <= 7
+          ? `⚠️ expires in ${s.sessionDaysLeft}d — refresh soon`
+          : `✅ fresh (~${s.sessionDaysLeft}d left)`;
   const lines = [
     "🍪 *YouTube Cookies Status*",
     "",
     `Source: \`${s.source}\``,
     `Path: \`${s.path}\``,
     `Valid: ${s.valid ? "✅ yes" : "❌ NO"}`,
+    `Session: ${freshness}`,
     `Detail: ${s.detail}`,
   ];
   if (s.total >= 0) {
@@ -277,6 +286,7 @@ export function registerAdminHandlers(bot: Telegraf<Context>): void {
       if (!status.valid) {
         await ctx.reply(
           `⚠️ Saved, but the cookies look INVALID:\n${status.detail}\n\n` +
+            "Your previous file was kept as `cookies.txt.bak` — nothing working was lost.\n\n" +
             "Export again while LOGGED IN at youtube.com (fresh private window, throwaway account), then send the file again.\n\n" +
             (config.cookiesContent
               ? "Remember to also update `COOKIES_CONTENT` on Render, or the old env value will overwrite this on next boot."
@@ -285,9 +295,16 @@ export function registerAdminHandlers(bot: Telegraf<Context>): void {
         return;
       }
       let extra = "";
-      if (status.expiringSoon > 0) extra = `\n⚠️ Note: ${status.expiringSoon} cookies expire within 7 days.`;
+      if (status.sessionDaysLeft !== null) {
+        extra = status.sessionDaysLeft <= 7
+          ? `\n⚠️ Note: login session expires in ${status.sessionDaysLeft}d — export fresh cookies soon.`
+          : `\n✅ Login session fresh (~${status.sessionDaysLeft}d left).`;
+      } else if (status.expiringSoon > 0) {
+        extra = `\n⚠️ Note: ${status.expiringSoon} cookies expire within 7 days.`;
+      }
       await ctx.reply(
         `✅ Cookies updated instantly — no restart needed.\n${status.detail}.${extra}\n\n` +
+          "Previous file kept as `cookies.txt.bak`.\n\n" +
           (config.cookiesContent
             ? "⚠️ `COOKIES_CONTENT` is set: update it on Render too, or this upload will be overwritten on the next restart."
             : "📌 On Render: also paste this file into the `COOKIES_CONTENT` env var so it survives restarts/redeploys.")

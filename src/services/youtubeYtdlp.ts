@@ -3,6 +3,7 @@ import * as fs from "fs";
 import * as path from "path";
 import * as crypto from "crypto";
 import { config } from "../config";
+import { lowerHeights, isTooLargeMessage } from "./quality";
 import type { DownloadProgress, DownloadResult } from "./downloader";
 
 /**
@@ -168,14 +169,26 @@ async function fetchVisitorData(): Promise<string | null> {
 
 /** Format selector: mobile stacks get itag-18 progressive (no merge); rest is height-capped. */
 function formatFor(mobile: boolean): string {
+  return formatForHeight(mobile, config.youtubeMaxHeight);
+}
+
+/** Same selector pinned to an explicit height (for lower-quality retries). */
+function formatForHeight(mobile: boolean, height: number): string {
   if (mobile) {
+    // Progressive itag ladder: 18 (360p) → 59/59… yt-dlp understands
+    // "18/worst" chains; keep 18 first (most reliable) with generic fallback.
+    if (height > 0 && height < 360) return "36/17/18/b[ext=mp4]/b";
     return "18/b[ext=mp4]/b";
   }
-  const h = config.youtubeMaxHeight;
-  if (h > 0) {
-    return `bv*[ext=mp4][height<=${h}]+ba[ext=m4a]/b[ext=mp4][height<=${h}]/b[height<=${h}]/b`;
+  if (height > 0) {
+    return `bv*[ext=mp4][height<=${height}]+ba[ext=m4a]/b[ext=mp4][height<=${height}]/b[height<=${height}]/b`;
   }
   return "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b";
+}
+
+/** True when yt-dlp's output means "over --max-filesize" (retry lower). */
+function isTooLargeOutput(msg: string): boolean {
+  return isTooLargeMessage(msg);
 }
 
 interface AttemptSpec {
@@ -299,25 +312,55 @@ function isBotCheck(msg: string): boolean {
   );
 }
 
-function runYtDlpAttempt(args: string[], onProgress?: (p: DownloadProgress) => void): Promise<string> {
+/**
+ * Run one yt-dlp attempt with a hard timeout (free-tier safety: a stuck
+ * client would otherwise hang the bot forever) and bounded output buffers
+ * (memory safety: progress lines accumulate on long downloads).
+ */
+function runYtDlpAttempt(
+  args: string[],
+  onProgress?: (p: DownloadProgress) => void,
+  timeoutMs: number = config.ytDlpAttemptTimeoutMs
+): Promise<string> {
+  const MAX_BUF = 512 * 1024; // 512KB cap per stream
   return new Promise((resolve, reject) => {
     const proc = spawn(resolveYtDlpPath(), args, { shell: false });
     let stdout = "";
     let stderr = "";
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { proc.kill("SIGKILL"); } catch {}
+      reject(new Error(`yt-dlp attempt timed out after ${Math.round(timeoutMs / 1000)}s (network stall or blocked client)`));
+    }, timeoutMs);
+    const append = (target: string, s: string): string => {
+      if (target.length >= MAX_BUF) return target;
+      const next = target + s;
+      return next.length > MAX_BUF ? next.slice(-MAX_BUF) : next;
+    };
     proc.stdout.on("data", (d: Buffer) => {
       const s = d.toString();
-      stdout += s;
+      stdout = append(stdout, s);
       const m = s.match(/(\d+\.\d+)%/);
       if (m && onProgress) onProgress({ percent: parseFloat(m[1]) });
     });
     proc.stderr.on("data", (d: Buffer) => {
       const s = d.toString();
-      stderr += s;
+      stderr = append(stderr, s);
       const m = s.match(/(\d+\.\d+)%/);
       if (m && onProgress) onProgress({ percent: parseFloat(m[1]) });
     });
-    proc.on("error", (err) => reject(new Error(`Failed to spawn yt-dlp: ${err.message}`)));
+    proc.on("error", (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(new Error(`Failed to spawn yt-dlp: ${err.message}`));
+    });
     proc.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
       if (code !== 0) return reject(new Error(stderr || stdout || `yt-dlp exited with code ${code}`));
       resolve(stdout);
     });
@@ -402,38 +445,55 @@ export async function downloadYouTubeViaYtDlp(
   let lastError = "";
   for (const attempt of attempts) {
     summary.tried++;
-    const args = [
-      ...baseArgs,
-      ...buildYoutubeArgs(attempt.playerClients, formatFor(attempt.mobile), attempt.useCookies, attempt.ipv4, visitorData),
-      "--print", "after_move:filepath",
-      url,
-    ];
-    try {
-      console.log(`⏳ YouTube yt-dlp attempt: ${attempt.name}${attempt.useCookies ? " (cookies)" : " (anonymous)"}${attempt.ipv4 ? "" : " (IPv6 route)"}…`);
-      const stdout = await runYtDlpAttempt(args, onProgress);
-      const result = resolveDownloadedFile(stdout, id);
-      _lastSummary = summary;
-      console.log(`✅ YouTube yt-dlp saved via ${attempt.name}: ${result.fileName} (${(result.size / 1048576).toFixed(1)} MB)`);
-      return result;
-    } catch (err: any) {
-      lastError = err?.message || String(err);
-      if (lastError.startsWith("❌")) throw err; // definitive (too large / audio-only)
-      if (isBotCheck(lastError)) summary.walled++;
-      console.warn(`⚠️ YouTube yt-dlp "${attempt.name}" failed: ${lastError.slice(0, 180)}`);
-      if (isFatalError(lastError)) {
+    // Quality ladder for this stack: start at the configured cap, step down
+    // when yt-dlp reports over --max-filesize (Telegram limit) instead of
+    // failing the video. Bounded to 2 extra heights so one stack can't
+    // triple the rotation time.
+    const baseHeight = config.youtubeMaxHeight > 0 ? config.youtubeMaxHeight : 720;
+    const heights = [baseHeight, ...lowerHeights(baseHeight)].slice(0, 3);
+    let stackDone = false;
+    for (const h of heights) {
+      const args = [
+        ...baseArgs,
+        ...buildYoutubeArgs(attempt.playerClients, formatForHeight(attempt.mobile, attempt.mobile ? 0 : h), attempt.useCookies, attempt.ipv4, visitorData),
+        "--print", "after_move:filepath",
+        url,
+      ];
+      try {
+        console.log(`⏳ YouTube yt-dlp attempt: ${attempt.name}${attempt.useCookies ? " (cookies)" : " (anonymous)"}${attempt.ipv4 ? "" : " (IPv6 route)"}${h !== baseHeight ? ` (retry ≤${h}p)` : ""}…`);
+        const stdout = await runYtDlpAttempt(args, onProgress);
+        const result = resolveDownloadedFile(stdout, id);
         _lastSummary = summary;
-        if (lastError.includes("max-filesize") || lastError.includes("File is larger than")) {
-          throw new Error(`❌ Video too large (>${config.maxFileSizeMB}MB). Try a shorter video.`);
+        console.log(`✅ YouTube yt-dlp saved via ${attempt.name}: ${result.fileName} (${(result.size / 1048576).toFixed(1)} MB)`);
+        return result;
+      } catch (err: any) {
+        lastError = err?.message || String(err);
+        if (lastError.startsWith("❌")) throw err; // definitive (audio-only)
+        if (isTooLargeOutput(lastError)) {
+          if (h !== heights[heights.length - 1]) {
+            console.log(`⚡ YouTube yt-dlp "${attempt.name}" over limit at ≤${h}p, trying lower quality…`);
+            continue; // next lower height, same stack
+          }
+          _lastSummary = summary;
+          throw new Error(`❌ Video too large (>${config.maxFileSizeMB}MB even at the lowest quality). Try a shorter video.`);
         }
-        if (lastError.includes("Unsupported URL")) {
-          throw new Error("❌ Unsupported URL. Make sure the link is a public video.");
-        }
-        if (/Private video|This video is private|Video unavailable/.test(lastError)) {
+        if (isBotCheck(lastError)) summary.walled++;
+        console.warn(`⚠️ YouTube yt-dlp "${attempt.name}" failed: ${lastError.slice(0, 180)}`);
+        if (isFatalError(lastError)) {
+          _lastSummary = summary;
+          if (lastError.includes("Unsupported URL")) {
+            throw new Error("❌ Unsupported URL. Make sure the link is a public video.");
+          }
+          if (/Private video|This video is private|Video unavailable/.test(lastError)) {
+            throw new Error("❌ Video unavailable or private.");
+          }
           throw new Error("❌ Video unavailable or private.");
         }
-        throw new Error("❌ Video unavailable or private.");
+        stackDone = true;
+        break; // non-size failure → next stack (not next height)
       }
     }
+    if (stackDone) continue;
   }
   _lastSummary = summary;
   console.warn(`⚠️ All YouTube yt-dlp attempts failed (${summary.tried} tried, ${summary.walled} bot-walled). Last: ${lastError.slice(0, 150)}`);

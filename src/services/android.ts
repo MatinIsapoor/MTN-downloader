@@ -3,6 +3,7 @@ import * as path from "path";
 import * as crypto from "crypto";
 import { config } from "../config";
 import { extractYouTubeId } from "./invidious";
+import { TooLargeError } from "./quality";
 import type { DownloadProgress, DownloadResult } from "./downloader";
 
 /**
@@ -129,23 +130,27 @@ interface YoutubeiResponse {
 }
 
 function pickProgressive(formats: YoutubeiFormat[], maxHeight: number): YoutubeiFormat | null {
+  return pickProgressiveSorted(formats, maxHeight)[0] || null;
+}
+
+/** All direct progressive MP4s sorted best-first (for lower-quality retries). */
+function pickProgressiveSorted(formats: YoutubeiFormat[], maxHeight: number): YoutubeiFormat[] {
   // Direct `url` only — signatureCipher needs player-JS deciphering (that's
   // yt-dlp's job; we deliberately don't do it here).
   const direct = formats.filter(
     (f) => f.url && (f.mimeType || "").includes("video/mp4")
   );
-  if (direct.length === 0) return null;
+  if (direct.length === 0) return [];
   const withH = direct.map((f) => ({ f, h: f.height || 0 }));
+  const known = withH.filter((x) => x.h > 0).sort((a, b) => b.h - a.h);
+  const unknown = withH.filter((x) => x.h <= 0).map((x) => x.f);
   if (maxHeight > 0) {
-    const fitting = withH.filter((x) => x.h > 0 && x.h <= maxHeight).sort((a, b) => b.h - a.h);
-    if (fitting.length > 0) return fitting[0].f;
-    const smallest = withH.filter((x) => x.h > 0).sort((a, b) => a.h - b.h);
-    if (smallest.length > 0) return smallest[0].f;
-  } else {
-    const known = withH.filter((x) => x.h > 0).sort((a, b) => b.h - a.h);
-    if (known.length > 0) return known[0].f;
+    const fitting = known.filter((x) => x.h <= maxHeight).map((x) => x.f);
+    const smaller = known.filter((x) => x.h > maxHeight).sort((a, b) => a.h - b.h).map((x) => x.f);
+    if (fitting.length > 0) return [...fitting, ...unknown, ...smaller];
+    return [...known.sort((a, b) => a.h - b.h).map((x) => x.f), ...unknown];
   }
-  return direct[0];
+  return [...known.map((x) => x.f), ...unknown];
 }
 
 function sanitizeFileName(name: string): string {
@@ -169,7 +174,7 @@ async function streamToFile(
     if (!res.ok || !res.body) throw new Error(`Video server HTTP ${res.status}`);
     const total = Number(res.headers.get("content-length") || 0);
     if (total > maxBytes) {
-      throw new Error(`❌ Video too large (>${config.maxFileSizeMB}MB). Try a shorter video.`);
+      throw new TooLargeError(`❌ This quality is over ${config.maxFileSizeMB}MB — trying a lower quality…`);
     }
     const file = fs.createWriteStream(filePath);
     let received = 0;
@@ -179,7 +184,7 @@ async function streamToFile(
         if (received > maxBytes) {
           file.destroy();
           try { fs.unlinkSync(filePath); } catch {}
-          throw new Error(`❌ Video too large (>${config.maxFileSizeMB}MB). Try a shorter video.`);
+          throw new TooLargeError(`❌ This quality is over ${config.maxFileSizeMB}MB — trying a lower quality…`);
         }
         if (!file.write(chunk)) await new Promise<void>((r) => file.once("drain", r));
         if (total > 0 && onProgress) onProgress({ percent: (received / total) * 100 });
@@ -191,6 +196,7 @@ async function streamToFile(
     }
   } catch (err: any) {
     try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch {}
+    if (err instanceof TooLargeError) throw err;
     if (err?.name === "AbortError") throw new Error("❌ Download timed out. Please try again.");
     throw err instanceof Error ? err : new Error(`❌ Download failed: ${err}`);
   } finally {
@@ -226,7 +232,7 @@ export async function downloadYouTubeViaAndroid(
   const failures: string[] = [];
   for (const client of YOUTUBEI_CLIENTS) {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 20000);
+    const timeout = setTimeout(() => controller.abort(), config.publicApiTimeoutMs);
     let data: YoutubeiResponse;
     try {
       const headers: Record<string, string> = {
@@ -270,34 +276,50 @@ export async function downloadYouTubeViaAndroid(
     }
 
     const formats = data?.streamingData?.formats || [];
-    const chosen = pickProgressive(formats, config.youtubeMaxHeight);
-    if (!chosen?.url) {
+    const ranked = pickProgressiveSorted(formats, config.youtubeMaxHeight);
+    if (ranked.length === 0 || !ranked[0]?.url) {
       console.warn(`⚠️ Youtubei ${client.name}: ${videoId} OK but no direct progressive mp4 (all ciphered?) — trying next client…`);
       failures.push(`${client.name}: ciphered-only`);
       continue;
     }
 
     const title = data?.videoDetails?.title || videoId;
-    console.log(`⚡ Youtubei ${client.name}: "${title.slice(0, 60)}" -> itag ${chosen.itag} (${chosen.height || "?"}p) progressive MP4`);
-
-    const id = crypto.randomBytes(6).toString("hex");
-    const fileName = `${id}_${sanitizeFileName(title)}.mp4`;
-    const filePath = path.join(config.downloadDir, fileName);
     if (!fs.existsSync(config.downloadDir)) fs.mkdirSync(config.downloadDir, { recursive: true });
+    const id = crypto.randomBytes(6).toString("hex");
 
-    await streamToFile(chosen.url, filePath, client.userAgent, onProgress);
-    const stat = fs.statSync(filePath);
-    if (stat.size === 0) {
-      try { fs.unlinkSync(filePath); } catch {}
-      throw new Error("empty file");
+    // Walk renditions best-first so an over-limit file retries lower quality
+    // on the same client before moving to the next client identity.
+    let saved: DownloadResult | null = null;
+    for (const chosen of ranked) {
+      if (!chosen?.url) continue;
+      console.log(`⚡ Youtubei ${client.name}: "${title.slice(0, 60)}" -> itag ${chosen.itag} (${chosen.height || "?"}p) progressive MP4`);
+      const fileName = `${id}_${sanitizeFileName(title)}.mp4`;
+      const filePath = path.join(config.downloadDir, fileName);
+      try {
+        await streamToFile(chosen.url, filePath, client.userAgent, onProgress);
+      } catch (err: any) {
+        if (err instanceof TooLargeError) {
+          console.log(`⚡ Youtubei ${client.name}: ${chosen.height || "?"}p over limit, trying lower quality…`);
+          continue;
+        }
+        throw err;
+      }
+      const stat = fs.statSync(filePath);
+      if (stat.size === 0) {
+        try { fs.unlinkSync(filePath); } catch {}
+        throw new Error("empty file");
+      }
+      console.log(`✅ Youtubei ${client.name} saved: ${fileName} (${(stat.size / 1048576).toFixed(1)} MB)`);
+      saved = { filePath, fileName, title, ext: "mp4", size: stat.size, platform: "youtube" };
+      break;
     }
-    console.log(`✅ Youtubei ${client.name} saved: ${fileName} (${(stat.size / 1048576).toFixed(1)} MB)`);
-    return { filePath, fileName, title, ext: "mp4", size: stat.size, platform: "youtube" };
+    if (saved) return saved;
+    throw new Error(`❌ Video too large (>${config.maxFileSizeMB}MB even at the lowest quality). Try a shorter video.`);
   }
 
   // Every client failed — surface the combined verdict so youtube.ts can
   // classify it. Prefer a LOGIN_REQUIRED/wall sample when present (it means
   // "walled", not "gone"), else the last failure.
-  const wallSample = failures.find((f) => /LOGIN_REQUIRED|not a bot|confirm you/i.test(f));
+  const wallSample = failures.find((f) => /LOGIN_REQUIRED|not a bot|confirm you|HTTP 429|Too Many|unplayable|ERROR/i.test(f));
   throw new Error(wallSample || failures[failures.length - 1] || "youtubei: all clients failed");
 }

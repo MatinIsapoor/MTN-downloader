@@ -7,6 +7,7 @@ import { detectPlatform } from "../utils/platform";
 import { downloadViaCobalt, isCobaltConfigured } from "./cobalt";
 import { downloadYouTubeCookieFree } from "./youtube";
 import { downloadPinterest } from "./pinterest";
+import { isTooLargeMessage } from "./quality";
 import { getFfmpegBinary, getFfmpegVersion, hasLibx264, normalizePinterestMp4 } from "./media";
 
 export interface DownloadResult {
@@ -38,6 +39,27 @@ export interface DownloadProgress {
 
 function ensureDownloadDir(): void {
   if (!fs.existsSync(config.downloadDir)) fs.mkdirSync(config.downloadDir, { recursive: true });
+}
+
+// --- Global concurrency guard (free-tier memory safety) -------------------
+// Each download spawns yt-dlp/ffmpeg children; unbounded parallelism OOMs a
+// 512MB Render instance. Personal use rarely exceeds 1-2 concurrent, so the
+// cap only bites during bursts — callers reply "busy, retry shortly".
+let activeDownloads = 0;
+
+/** Try to take a download slot. Returns false when the bot is saturated. */
+export function tryAcquireDownloadSlot(): boolean {
+  if (activeDownloads >= config.maxConcurrentDownloads) return false;
+  activeDownloads++;
+  return true;
+}
+
+export function releaseDownloadSlot(): void {
+  activeDownloads = Math.max(0, activeDownloads - 1);
+}
+
+export function getActiveDownloadCount(): number {
+  return activeDownloads;
 }
 
 function checkYtDlp(): boolean {
@@ -184,6 +206,10 @@ export interface CookieStatus {
   hasLoginSession: boolean;
   valid: boolean;
   detail: string;
+  /** Days until the soonest-expiring SESSION cookie expires (null = unknown/none). Negative = already expired. */
+  sessionDaysLeft: number | null;
+  /** One-line human summary of session freshness for the admin panel. */
+  expiryText: string;
 }
 
 /** Parse a Netscape cookies file into rows. Returns null when unreadable. */
@@ -226,14 +252,13 @@ export function decodeCookiesEnv(raw: string): string | null {
 
 /** Validate raw cookies text. Shared by file, env var, and Telegram uploads. */
 export function validateCookiesContent(raw: string): CookieStatus {
+  const empty: CookieStatus = {
+    source: "file", path: config.cookiesPath, total: 0, youtube: 0,
+    expiredYoutube: 0, expiringSoon: 0, hasLoginSession: false, valid: false,
+    detail: "unreadable", sessionDaysLeft: null, expiryText: "unknown",
+  };
   const rows = parseCookieFile(raw);
-  if (!rows) {
-    return {
-      source: "file", path: config.cookiesPath, total: 0, youtube: 0,
-      expiredYoutube: 0, expiringSoon: 0, hasLoginSession: false, valid: false,
-      detail: "unreadable",
-    };
-  }
+  if (!rows) return empty;
   const now = Math.floor(Date.now() / 1000);
   const soon = now + 7 * 24 * 3600;
   const yt = rows.filter((r) => r.domain.includes("youtube.com"));
@@ -243,6 +268,35 @@ export function validateCookiesContent(raw: string): CookieStatus {
   const hasLoginSession =
     (names.has("SID") || names.has("__Secure-1PSID") || names.has("__Secure-3PSID")) &&
     (names.has("LOGIN_INFO") || names.has("SSID") || names.has("HSID"));
+  // Session freshness: the login session dies with the earliest-expiring
+  // SESSION cookie (SID/HSID/SSID/LOGIN_INFO family), not with prefs cookies
+  // (PREF/VISITOR_INFO) that live for years. Report that specifically.
+  const SESSION_NAMES = new Set([
+    "SID", "__Secure-1PSID", "__Secure-3PSID", "__Secure-1PSIDTS",
+    "HSID", "SSID", "__Secure-1PAPISID", "__Secure-3PAPISID",
+    "LOGIN_INFO", "SIDCC", "__Secure-3PSIDCC",
+  ]);
+  const sessionExpiries = yt
+    .filter((r) => SESSION_NAMES.has(r.name) && r.expires !== 0)
+    .map((r) => r.expires);
+  let sessionDaysLeft: number | null = null;
+  let expiryText = "unknown";
+  if (sessionExpiries.length > 0) {
+    const soonest = Math.min(...sessionExpiries);
+    sessionDaysLeft = Math.floor((soonest - now) / 86400);
+    if (sessionDaysLeft < 0) {
+      expiryText = `login session EXPIRED ${-sessionDaysLeft}d ago — refresh now`;
+    } else if (sessionDaysLeft <= 7) {
+      expiryText = `login session expires in ${sessionDaysLeft}d — refresh soon`;
+    } else {
+      expiryText = `login session fresh (~${sessionDaysLeft}d left)`;
+    }
+  } else if (hasLoginSession) {
+    expiryText = "session cookies have no expiry (session-only) — valid while the browser session lives";
+  } else {
+    expiryText = "no login session found";
+  }
+  const base = (s: Partial<CookieStatus>): CookieStatus => ({ ...empty, ...s });
   let detail: string;
   let valid = true;
   if (rows.length === 0) {
@@ -263,11 +317,11 @@ export function validateCookiesContent(raw: string): CookieStatus {
     if (expired > 0) detail += `, ${expired} expired`;
     if (expiring > 0) detail += `, ${expiring} expire within 7 days`;
   }
-  return {
-    source: "file", path: config.cookiesPath, total: rows.length, youtube: yt.length,
+  return base({
+    total: rows.length, youtube: yt.length,
     expiredYoutube: expired, expiringSoon: expiring,
-    hasLoginSession, valid, detail,
-  };
+    hasLoginSession, valid, detail, sessionDaysLeft, expiryText,
+  });
 }
 
 /** Save fresh cookies text to disk (used by env restore + Telegram upload). No restart needed. */
@@ -276,15 +330,21 @@ export function saveCookiesContent(raw: string): CookieStatus {
   const dir = path.dirname(config.cookiesPath);
   try {
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    // Keep one backup so a bad upload never destroys the last working file.
+    try {
+      if (fs.existsSync(config.cookiesPath)) {
+        fs.copyFileSync(config.cookiesPath, `${config.cookiesPath}.bak`);
+      }
+    } catch {}
     const normalized = raw.trim().endsWith("\n") ? raw.trim() + "\n" : raw.trim() + "\n";
     fs.writeFileSync(config.cookiesPath, normalized, "utf8");
   } catch (err: any) {
     throw new Error(`❌ Could not save cookies file (${config.cookiesPath}): ${err?.message || err}`);
   }
   if (!status.valid) {
-    console.warn(`⚠️ Saved cookies look invalid: ${status.detail}`);
+    console.warn(`⚠️ Saved cookies look invalid: ${status.detail} (previous file kept at ${config.cookiesPath}.bak)`);
   } else {
-    console.log(`✅ Cookies saved to ${config.cookiesPath} (${status.detail}) — applies to the next download, no restart needed.`);
+    console.log(`✅ Cookies saved to ${config.cookiesPath} (${status.detail}; ${status.expiryText}) — applies to the next download, no restart needed.`);
   }
   return status;
 }
@@ -326,6 +386,7 @@ export function getCookiesStatus(): CookieStatus {
       source: "browser", path: config.cookiesFromBrowser, total: -1, youtube: -1,
       expiredYoutube: 0, expiringSoon: 0, hasLoginSession: true, valid: true,
       detail: `reading from browser "${config.cookiesFromBrowser}"`,
+      sessionDaysLeft: null, expiryText: "managed by the browser — refresh by re-logging in there",
     };
   }
   try {
@@ -338,6 +399,7 @@ export function getCookiesStatus(): CookieStatus {
       source: "none", path: config.cookiesPath, total: 0, youtube: 0,
       expiredYoutube: 0, expiringSoon: 0, hasLoginSession: false, valid: false,
       detail: `no cookies file at ${config.cookiesPath}`,
+      sessionDaysLeft: null, expiryText: "no cookies installed",
     };
   }
 }
@@ -367,9 +429,11 @@ export function logDownloaderDiagnostics(): void {
     console.log(`🔧 Cookies: reading from browser "${config.cookiesFromBrowser}"`);
   } else if (hasCookies()) {
     const status = getCookiesStatus();
-    console.log(`🔧 Cookies: using file ${config.cookiesPath} (${status.detail})`);
+    console.log(`🔧 Cookies: using file ${config.cookiesPath} (${status.detail}; ${status.expiryText})`);
     if (!status.valid) {
       console.warn(`⚠️ Cookies look INVALID: ${status.detail}. Cookie-only videos will fail until fresh cookies are uploaded (send cookies.txt to the bot, no restart needed).`);
+    } else if (status.sessionDaysLeft !== null && status.sessionDaysLeft <= 7) {
+      console.warn(`⚠️ ${status.expiryText} — plan a refresh soon (send a fresh cookies.txt to the bot).`);
     } else if (status.expiringSoon > 0) {
       console.warn(`⚠️ ${status.expiringSoon} YouTube cookies expire within 7 days — plan a refresh soon (send a fresh cookies.txt to the bot).`);
     }
@@ -385,7 +449,7 @@ export function logDownloaderDiagnostics(): void {
         `Most public videos work; age-gated/private ones need cookies (send cookies.txt to the bot).`
     );
   }
-  console.log(`🔧 YouTube mode: yt-dlp PRIMARY + HTTPS fallbacks — yt-dlp ${config.youtubeYtdlpFirst ? "first" : "last"} (${config.youtubeYtdlpFallback ? "ON" : "OFF"}) → Cobalt → Piped → Invidious → youtubei multi-client, max-height=${config.youtubeMaxHeight === 0 ? "uncapped" : config.youtubeMaxHeight + "p"}`);
+  console.log(`🔧 YouTube mode: yt-dlp PRIMARY + HTTPS fallbacks — yt-dlp ${config.youtubeYtdlpFirst ? "first" : "last"} (${config.youtubeYtdlpFallback ? "ON" : "OFF"}) → Cobalt → youtubei → Piped → Invidious, max-height=${config.youtubeMaxHeight === 0 ? "uncapped" : config.youtubeMaxHeight + "p"}`);
   if (config.ytDlpExtraArgs.length > 0) console.log(`🔧 yt-dlp extra args: ${config.ytDlpExtraArgs.join(" ")}`);
   if (config.potServerUrl) console.log(`🔧 PO-token provider: ${config.potServerUrl} (bgutil plugin required)`);
   console.log(
@@ -418,8 +482,14 @@ export function logDownloaderDiagnostics(): void {
     console.log("🔧 Proxy: none (datacenter IP — if YouTube hard-blocks it, set YT_DLP_PROXY to a residential proxy)");
   console.log(
     config.tiktokFallback
-      ? "🔧 TikTok fallback providers: enabled (tikwm x2 + ssstik)"
+      ? "🔧 TikTok fallback providers: enabled (tikwm x2 + ssstik, retried with UA rotation)"
       : "🔧 TikTok fallback providers: disabled (TIKTOK_FALLBACK=false)"
+  );
+  console.log(
+    `🔧 Stability: max ${config.maxConcurrentDownloads} concurrent download(s), ` +
+      `per-download budget ${Math.round(config.downloadTimeoutMs / 1000)}s, ` +
+      `yt-dlp attempt timeout ${Math.round(config.ytDlpAttemptTimeoutMs / 1000)}s, ` +
+      `public-API timeout ${Math.round(config.publicApiTimeoutMs / 1000)}s`
   );
 }
 
@@ -427,6 +497,18 @@ const AUDIO_EXTENSIONS = new Set(["m4a", "mp3", "ogg", "opus", "wav", "aac", "fl
 
 const TIKTOK_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+
+/** Rotating UAs: providers fingerprint per (IP, UA) — a blocked UA often passes with another. */
+const TIKTOK_UAS = [
+  TIKTOK_UA,
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
+  "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Mobile/15E148 Safari/604.1",
+  "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36",
+];
+
+function tikTokUa(seed: number): string {
+  return TIKTOK_UAS[Math.abs(seed) % TIKTOK_UAS.length];
+}
 
 let _hasAria2c: boolean | null = null;
 /** aria2c with 8 connections downloads progressive mp4s much faster than native. */
@@ -523,6 +605,10 @@ function attemptsFor(platform: string): AttemptSpec[] {
     return [];
   }
   if (platform === "tiktok") {
+    // Three independent draws: impersonated TLS (defeats most IP/UA walls),
+    // plain yt-dlp with cookies, then fully anonymous. Cookies sometimes HURT
+    // (a stale session redirects to login where anonymous passes), so the
+    // anonymous attempt stays even when cookies exist.
     const attempts: AttemptSpec[] = [];
     if (supportsImpersonate()) {
       attempts.push({
@@ -532,10 +618,28 @@ function attemptsFor(platform: string): AttemptSpec[] {
       });
     }
     attempts.push({ name: "default", extraArgs: ["-f", "b[ext=mp4]/b"], useCookies: true });
+    if (hasCookies() && config.youtubeCookieMode !== "never") {
+      attempts.push({ name: "anonymous", extraArgs: ["-f", "b[ext=mp4]/b"], useCookies: false });
+    }
     return attempts;
   }
   if (platform === "instagram" || platform === "twitter") {
-    return [{ name: "default", extraArgs: ["-f", "b[ext=mp4]/b"], useCookies: true }];
+    // Same idea: impersonation first (TLS fingerprint is the usual block),
+    // then cookies, then anonymous — Instagram/Twitter rate-limit logged-in
+    // sessions aggressively, so anonymous is a genuinely different route.
+    const attempts: AttemptSpec[] = [];
+    if (supportsImpersonate()) {
+      attempts.push({
+        name: "impersonate",
+        extraArgs: ["--impersonate", "chrome", "-f", "b[ext=mp4]/b"],
+        useCookies: true,
+      });
+    }
+    attempts.push({ name: "default", extraArgs: ["-f", "b[ext=mp4]/b"], useCookies: true });
+    if (hasCookies() && config.youtubeCookieMode !== "never") {
+      attempts.push({ name: "anonymous", extraArgs: ["-f", "b[ext=mp4]/b"], useCookies: false });
+    }
+    return attempts;
   }
   if (platform === "pinterest") {
     // Progressive MP4 first (single file, no merge). HLS-only story pins
@@ -575,37 +679,60 @@ function isTikTokBlock(msg: string): boolean {
   return (
     msg.includes("Your IP address is blocked") ||
     msg.includes("Unexpected response from webpage") ||
+    /HTTP 429|Too Many Requests|rate-limit/i.test(msg) ||
     /TikTok.*(blocked|denied|capital|verify)/i.test(msg)
   );
 }
 
-/** Run one yt-dlp attempt. Resolves with stdout on success, rejects with combined output on failure. */
+/** Run one yt-dlp attempt: hard timeout + bounded buffers (hang/memory safety). */
 function runYtDlpAttempt(
   args: string[],
   onProgress?: (p: DownloadProgress) => void
 ): Promise<string> {
+  const timeoutMs = config.ytDlpAttemptTimeoutMs;
+  const MAX_BUF = 512 * 1024; // 512KB cap per stream
   return new Promise((resolve, reject) => {
     const proc = spawn(config.ytDlpPath, args, { shell: false });
     let stdout = "";
     let stderr = "";
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { proc.kill("SIGKILL"); } catch {}
+      reject(new Error(`yt-dlp attempt timed out after ${Math.round(timeoutMs / 1000)}s (network stall or blocked client)`));
+    }, timeoutMs);
+    const append = (target: string, s: string): string => {
+      if (target.length >= MAX_BUF) return target;
+      const next = target + s;
+      return next.length > MAX_BUF ? next.slice(-MAX_BUF) : next;
+    };
 
     proc.stdout.on("data", (d: Buffer) => {
       const s = d.toString();
-      stdout += s;
+      stdout = append(stdout, s);
       const m = s.match(/(\d+\.\d+)%/);
       if (m && onProgress) onProgress({ percent: parseFloat(m[1]) });
     });
 
     proc.stderr.on("data", (d: Buffer) => {
       const s = d.toString();
-      stderr += s;
+      stderr = append(stderr, s);
       const m = s.match(/(\d+\.\d+)%/);
       if (m && onProgress) onProgress({ percent: parseFloat(m[1]) });
     });
 
-    proc.on("error", (err) => reject(new Error(`Failed to spawn yt-dlp: ${err.message}`)));
+    proc.on("error", (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(new Error(`Failed to spawn yt-dlp: ${err.message}`));
+    });
 
     proc.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
       if (code !== 0) {
         return reject(new Error(stderr || stdout || `yt-dlp exited with code ${code}`));
       }
@@ -682,20 +809,21 @@ interface TikTokResolved {
 const VIDEO_NOT_FOUND_MSG =
   "❌ TikTok video not found. It may be private, deleted, or the link is wrong.";
 
-/** GET JSON with timeout + one retry for transient network blips. */
-async function fetchJson(url: string, headers: Record<string, string>, timeoutMs = 30000): Promise<any> {
+/** GET JSON with timeout + retries (backoff) + UA rotation for transient blips. */
+async function fetchJson(url: string, headers: Record<string, string>, timeoutMs = 30000, retries = 2): Promise<any> {
   let lastError = "";
-  for (let attempt = 1; attempt <= 2; attempt++) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const res = await fetch(url, { headers, signal: controller.signal });
+      const ua = attempt === 1 ? headers["User-Agent"] : tikTokUa(attempt + url.length);
+      const res = await fetch(url, { headers: { ...headers, "User-Agent": ua }, signal: controller.signal });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return await res.json();
     } catch (err: any) {
       lastError = err?.name === "AbortError" ? "timed out" : (err?.message || String(err));
-      console.warn(`⚠️ GET ${url.slice(0, 60)}… attempt ${attempt} failed: ${lastError.slice(0, 120)}`);
-      if (attempt < 2) await new Promise((r) => setTimeout(r, 2000));
+      console.warn(`⚠️ GET ${url.slice(0, 60)}… attempt ${attempt}/${retries} failed: ${lastError.slice(0, 120)}`);
+      if (attempt < retries) await new Promise((r) => setTimeout(r, attempt * 2000));
     } finally {
       clearTimeout(timeout);
     }
@@ -724,43 +852,61 @@ async function resolveViaTikwm(apiBase: string, videoUrl: string): Promise<TikTo
 /**
  * ssstik.io resolver (fully independent provider).
  * GET /en (grab s_tt token + cookies) → POST /abc?url=dl → parse download link.
+ * Retried once with a rotated UA — ssstik rate-limits per (IP, UA) and the
+ * token page layout drifts, so both the fetch AND the parse are retried.
  */
 async function resolveViaSsstik(videoUrl: string): Promise<TikTokResolved> {
-  const pageRes = await fetch("https://ssstik.io/en", { headers: { "User-Agent": TIKTOK_UA } });
-  if (!pageRes.ok) throw new Error(`ssstik page HTTP ${pageRes.status}`);
-  const html = await pageRes.text();
-  const token = html.match(/s_tt\s*=\s*'([^']+)'/)?.[1];
-  if (!token) throw new Error("ssstik token not found (page layout changed?)");
-  const cookies = [...pageRes.headers.getSetCookie()].map((c) => c.split(";")[0]).join("; ");
+  let lastError = "";
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const ua = tikTokUa(attempt + videoUrl.length);
+      const pageRes = await fetch("https://ssstik.io/en", { headers: { "User-Agent": ua } });
+      if (!pageRes.ok) throw new Error(`ssstik page HTTP ${pageRes.status}`);
+      const html = await pageRes.text();
+      const token = html.match(/s_tt\s*=\s*'([^']+)'/)?.[1] || html.match(/s_tt\s*=\s*"([^"]+)"/)?.[1];
+      if (!token) throw new Error("ssstik token not found (page layout changed?)");
+      const cookies = [...pageRes.headers.getSetCookie()].map((c) => c.split(";")[0]).join("; ");
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 30000);
-  let resultHtml = "";
-  try {
-    const res = await fetch("https://ssstik.io/abc?url=dl", {
-      method: "POST",
-      headers: {
-        "User-Agent": TIKTOK_UA,
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-        Origin: "https://ssstik.io",
-        Referer: "https://ssstik.io/en",
-        Cookie: cookies,
-      },
-      body: new URLSearchParams({ id: videoUrl, locale: "en", tt: token }).toString(),
-      signal: controller.signal,
-    });
-    if (!res.ok) throw new Error(`ssstik resolve HTTP ${res.status}`);
-    resultHtml = await res.text();
-  } finally {
-    clearTimeout(timeout);
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 30000);
+      let resultHtml = "";
+      try {
+        const res = await fetch("https://ssstik.io/abc?url=dl", {
+          method: "POST",
+          headers: {
+            "User-Agent": ua,
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            Origin: "https://ssstik.io",
+            Referer: "https://ssstik.io/en",
+            Cookie: cookies,
+          },
+          body: new URLSearchParams({ id: videoUrl, locale: "en", tt: token }).toString(),
+          signal: controller.signal,
+        });
+        if (!res.ok) throw new Error(`ssstik resolve HTTP ${res.status}`);
+        resultHtml = await res.text();
+      } finally {
+        clearTimeout(timeout);
+      }
+      // No-watermark link: double- or single-quoted href, or data-href attr.
+      const unescaped = resultHtml.replace(/\\\//g, "/");
+      const playUrl =
+        [...unescaped.matchAll(/href="(https:[^"]+)"/g)].map((m) => m[1])[0] ||
+        [...unescaped.matchAll(/href='(https:[^']+)'/g)].map((m) => m[1])[0] ||
+        [...unescaped.matchAll(/data-href="(https:[^"]+)"/g)].map((m) => m[1])[0];
+      if (!playUrl) {
+        console.warn(`ssstik returned no download link (len=${resultHtml.length})`);
+        throw new VideoNotFoundError(VIDEO_NOT_FOUND_MSG);
+      }
+      return { playUrl, source: "ssstik" };
+    } catch (err: any) {
+      if (err instanceof VideoNotFoundError) throw err;
+      lastError = err?.message || String(err);
+      console.warn(`⚠️ ssstik attempt ${attempt}/2 failed: ${lastError.slice(0, 120)}`);
+      if (attempt < 2) await new Promise((r) => setTimeout(r, 3000));
+    }
   }
-  // First https link is the no-watermark download.
-  const playUrl = [...resultHtml.matchAll(/href="(https:[^"]+)"/g)].map((m) => m[1])[0];
-  if (!playUrl) {
-    console.warn(`ssstik returned no download link (len=${resultHtml.length})`);
-    throw new VideoNotFoundError(VIDEO_NOT_FOUND_MSG);
-  }
-  return { playUrl, source: "ssstik" };
+  throw new Error(lastError || "ssstik failed");
 }
 
 /** Stream a remote mp4 to disk with max-size enforcement. */
@@ -841,14 +987,21 @@ async function downloadTikTokFallback(
       const msg = err?.message || String(err);
       console.warn(`⚠️ TikTok provider ${p.name} failed: ${msg.slice(0, 150)}`);
       failures.push(`${p.name}: ${msg.slice(0, 100)}`);
+      // Brief pause between providers: hammering all three back-to-back from
+      // one datacenter IP looks like a bot burst and gets the IP throttled.
+      await new Promise((r) => setTimeout(r, 1500));
     }
   }
 
   if (!resolved) {
     console.error(`❌ All TikTok fallback providers failed: ${failures.join(" | ")}`);
+    const rateLimited = failures.some((f) => /429|Too Many|blocked|denied|capital|verify|timed out/i.test(f));
     throw new Error(
-      "❌ TikTok is unreachable right now (its anti-bot blocks this server's network on every route). " +
-      "Please try again in a few minutes or try another link."
+      rateLimited
+        ? "❌ TikTok is rate-limiting this server right now (its anti-bot blocks datacenter IPs per-video and temporarily). " +
+          "Please wait a few minutes and try again, or try another link."
+        : "❌ TikTok is unreachable right now (its anti-bot blocks this server's network on every route). " +
+          "Please try again in a few minutes or try another link."
     );
   }
 
@@ -873,11 +1026,33 @@ function mapDownloadError(msg: string, platform: string): Error {
   if (msg.includes("Video unavailable") || msg.includes("Private video") || msg.includes("This video is private")) {
     return new Error("❌ Video unavailable or private.");
   }
-  if (msg.includes("max-filesize") || msg.includes("File is larger than")) {
-    return new Error(`❌ Video too large (>${config.maxFileSizeMB}MB). Try a shorter video.`);
+  if (isTooLargeMessage(msg)) {
+    return new Error(`❌ Video too large (>${config.maxFileSizeMB}MB even at the lowest quality). Try a shorter video.`);
   }
   if (msg.includes("Requested format is not available")) {
-    return new Error("❌ Requested format not available.");
+    return new Error("❌ This video has no downloadable format (it may be a live stream, premiere, or DRM-protected). Try another link.");
+  }
+  if (/timed out|timed out after|network stall/i.test(msg)) {
+    return new Error(
+      "❌ Download timed out (the video server is slow or blocking this region right now).\n\n" +
+        "Please try again in a few minutes."
+    );
+  }
+  if (/HTTP 429|Too Many Requests|rate-limit|rate limited/i.test(msg)) {
+    return new Error(
+      `❌ ${platform} is rate-limiting this server right now (too many requests from one IP).\n\n` +
+        "Please wait a few minutes and try again."
+    );
+  }
+  if (/ENOTFOUND|EAI_AGAIN|ECONNREFUSED|EHOSTUNREACH|ENETUNREACH|network is unreachable/i.test(msg)) {
+    return new Error(
+      "❌ Network error reaching the video server (DNS/connection failed).\n\n" +
+        "Please try again in a minute."
+    );
+  }
+  if (/No space left|ENOSPC|disk/i.test(msg)) {
+    console.error(`❌ Disk full while downloading: ${msg.slice(0, 200)}`);
+    return new Error("❌ Server storage is full — the admin needs to clear the downloads folder. Try again later.");
   }
   if (platform === "youtube" && isYouTubeBotCheck(msg)) {
     // YouTube no longer uses yt-dlp/cookies — this branch only fires if a
@@ -892,8 +1067,8 @@ function mapDownloadError(msg: string, platform: string): Error {
   }
   if (platform === "tiktok" && isTikTokBlock(msg)) {
     return new Error(
-      "❌ TikTok blocked this download (network restriction, or the video is private/deleted). " +
-      "Please try again later or try another link."
+      "❌ TikTok blocked this download (anti-bot rate-limit on this server's network, or the video is private/deleted). " +
+      "Wait a few minutes and try again, or try another link."
     );
   }
   if (platform === "youtube" && msg.includes("Failed to extract any player response")) {
@@ -1014,6 +1189,7 @@ export async function downloadVideo(
   const attempts = attemptsFor(platform);
   let lastError = "";
   const allErrors: string[] = [];
+  let retriedLower = false;
   for (const attempt of attempts) {
     // Cookies are attached per-attempt: cookie-respecting clients get them,
     // anonymous clients run WITHOUT them (some ignore cookies, and pairing
@@ -1043,6 +1219,38 @@ export async function downloadVideo(
       lastError = err?.message || String(err);
       allErrors.push(`[${attempt.name}] ${lastError}`);
       console.warn(`⚠️ ${platform} strategy "${attempt.name}" failed: ${lastError.slice(0, 200)}`);
+      // Over-limit files get ONE lower-quality retry (480p cap) before we
+      // call it fatal — long/high-bitrate reels often fit at 480p.
+      if (isTooLargeMessage(lastError) && !retriedLower) {
+        retriedLower = true;
+        console.log(`⚡ ${platform} over ${config.maxFileSizeMB}MB — retrying at lower quality (≤480p)…`);
+        const lowArgs = [
+          ...baseArgs,
+          ...buildCommonArgs(attempt.useCookies, attempt.chunked !== false),
+          "-f",
+          platform === "pinterest"
+            ? "b[ext=mp4][height<=480]/bv*[height<=480]+ba/b[height<=480]/b"
+            : "bv*[ext=mp4][height<=480]+ba[ext=m4a]/b[ext=mp4][height<=480]/b[height<=480]/b",
+          "--print",
+          "after_move:filepath",
+          url,
+        ];
+        try {
+          const stdout = await runYtDlpAttempt(lowArgs, onProgress);
+          const resolved = resolveDownloadedFile(stdout, id, platform);
+          if (pinterestImageFallback && pinterestImageFallback.filePath !== resolved.filePath) {
+            try { fs.unlinkSync(pinterestImageFallback.filePath); } catch {}
+            pinterestImageFallback = null;
+          }
+          if (platform === "pinterest" && resolved.ext.toLowerCase() === "mp4") return normalizePinterestMp4(resolved);
+          console.log(`✅ ${platform} saved at lower quality: ${resolved.fileName} (${(resolved.size / 1048576).toFixed(1)} MB)`);
+          return resolved;
+        } catch (lowErr: any) {
+          lastError = lowErr?.message || String(lowErr);
+          allErrors.push(`[lower-quality] ${lastError}`);
+          console.warn(`⚠️ ${platform} lower-quality retry failed: ${lastError.slice(0, 200)}`);
+        }
+      }
       // Fatal errors (private/deleted/too large/unsupported) won't be fixed by another strategy.
       // Exception: a saved Pinterest image still beats an error — e.g. yt-dlp
       // reports "Requested format is not available" for image-only pins that
@@ -1096,6 +1304,7 @@ export function cleanupFile(filePath: string): void {
 /**
  * Extract the video's audio track to MP3 using ffmpeg.
  * Returns the mp3 path. Throws if the video has no audio track or ffmpeg fails.
+ * Hard timeout (120s): a stuck ffmpeg would otherwise hang the bot's cleanup.
  */
 export function extractAudio(videoPath: string): Promise<AudioResult> {
   return new Promise((resolve, reject) => {
@@ -1113,17 +1322,32 @@ export function extractAudio(videoPath: string): Promise<AudioResult> {
     const args = ["-y", "-i", videoPath, "-vn", "-c:a", "libmp3lame", "-q:a", "4", audioPath];
     const proc = spawn(ffmpeg, args, { shell: false });
     let stderr = "";
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { proc.kill("SIGKILL"); } catch {}
+      try { if (fs.existsSync(audioPath)) fs.unlinkSync(audioPath); } catch {}
+      reject(new Error("⚠️ Music extraction timed out — the video was still sent."));
+    }, 120000);
 
     proc.stderr.on("data", (d: Buffer) => {
       stderr += d.toString();
+      if (stderr.length > 64 * 1024) stderr = stderr.slice(-64 * 1024);
     });
     proc.stdout.on("data", () => {});
 
     proc.on("error", (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
       reject(new Error(`Failed to run ffmpeg (${ffmpeg}): ${err.message}. Install ffmpeg: https://ffmpeg.org/download.html`));
     });
 
     proc.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
       try {
         if (code === 0 && fs.existsSync(audioPath)) {
           const stat = fs.statSync(audioPath);
@@ -1158,6 +1382,39 @@ export function cleanupOldFiles(maxAgeHours = 2): void {
         const stat = fs.statSync(fp);
         if (now - stat.mtimeMs > maxAgeHours * 3600 * 1000) fs.unlinkSync(fp);
       } catch {}
+    }
+  } catch {}
+}
+
+/**
+ * Disk-budget guard for small hosts (Render free ≈ ephemeral disk).
+ * When the downloads dir exceeds `maxMB` (default 1500MB), deletes the
+ * oldest files first until under budget. Runs on boot + hourly alongside
+ * cleanupOldFiles. Never throws.
+ */
+export function enforceDiskBudget(maxMB = 1500): void {
+  try {
+    if (!fs.existsSync(config.downloadDir)) return;
+    const entries = fs.readdirSync(config.downloadDir)
+      .map((f) => {
+        const fp = path.join(config.downloadDir, f);
+        try {
+          const stat = fs.statSync(fp);
+          return stat.isFile() ? { fp, size: stat.size, mtime: stat.mtimeMs } : null;
+        } catch {
+          return null;
+        }
+      })
+      .filter((e): e is { fp: string; size: number; mtime: number } => e !== null)
+      .sort((a, b) => a.mtime - b.mtime);
+    let total = entries.reduce((s, e) => s + e.size, 0);
+    const budget = maxMB * 1024 * 1024;
+    if (total <= budget) return;
+    for (const e of entries) {
+      try { fs.unlinkSync(e.fp); } catch {}
+      total -= e.size;
+      console.log(`🧹 Disk budget: removed oldest file ${path.basename(e.fp)}`);
+      if (total <= budget) break;
     }
   } catch {}
 }

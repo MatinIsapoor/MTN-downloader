@@ -3,6 +3,7 @@ import * as path from "path";
 import * as crypto from "crypto";
 import { config } from "../config";
 import { extractYouTubeId } from "./invidious";
+import { TooLargeError } from "./quality";
 import type { DownloadProgress, DownloadResult } from "./downloader";
 
 const UA =
@@ -48,22 +49,31 @@ export function pickPipedStream(
   streams: PipedVideoStream[],
   maxHeight: number
 ): PipedVideoStream | null {
+  return pickPipedStreamsSorted(streams, maxHeight)[0] || null;
+}
+
+/**
+ * All progressive MP4s sorted best-first (at/under cap first, then smaller
+ * fallbacks). The downloader walks this list so an over-limit rendition
+ * retries the next lower one instead of failing the whole video.
+ */
+export function pickPipedStreamsSorted(
+  streams: PipedVideoStream[],
+  maxHeight: number
+): PipedVideoStream[] {
   const mp4s = streams.filter(isProgressiveMp4);
-  if (mp4s.length === 0) return null;
+  if (mp4s.length === 0) return [];
   const withHeight = mp4s.map((s) => ({ s, h: parseHeight(s) }));
+  const known = withHeight.filter((x) => x.h > 0).sort((a, b) => b.h - a.h);
+  const unknown = withHeight.filter((x) => x.h <= 0).map((x) => x.s);
   if (maxHeight > 0) {
-    const fitting = withHeight.filter((x) => x.h > 0 && x.h <= maxHeight);
-    if (fitting.length > 0) {
-      fitting.sort((a, b) => b.h - a.h);
-      return fitting[0].s;
-    }
-    const known = withHeight.filter((x) => x.h > 0).sort((a, b) => a.h - b.h);
-    if (known.length > 0) return known[0].s;
-  } else {
-    const known = withHeight.filter((x) => x.h > 0).sort((a, b) => b.h - a.h);
-    if (known.length > 0) return known[0].s;
+    const fitting = known.filter((x) => x.h <= maxHeight).map((x) => x.s);
+    const smaller = known.filter((x) => x.h > maxHeight).sort((a, b) => a.h - b.h).map((x) => x.s);
+    // Best fit first, then progressively smaller (over-cap ones last resort).
+    if (fitting.length > 0) return [...fitting, ...unknown, ...smaller];
+    return [...known.sort((a, b) => a.h - b.h).map((x) => x.s), ...unknown];
   }
-  return mp4s[0];
+  return [...known.map((x) => x.s), ...unknown];
 }
 
 function sanitizeFileName(name: string): string {
@@ -86,7 +96,7 @@ async function streamToFile(
     if (!res.ok || !res.body) throw new Error(`Video server HTTP ${res.status}`);
     const total = Number(res.headers.get("content-length") || 0);
     if (total > maxBytes) {
-      throw new Error(`❌ Video too large (>${config.maxFileSizeMB}MB). Try a shorter video.`);
+      throw new TooLargeError(`❌ This quality is over ${config.maxFileSizeMB}MB — trying a lower quality…`);
     }
     const file = fs.createWriteStream(filePath);
     let received = 0;
@@ -96,7 +106,7 @@ async function streamToFile(
         if (received > maxBytes) {
           file.destroy();
           try { fs.unlinkSync(filePath); } catch {}
-          throw new Error(`❌ Video too large (>${config.maxFileSizeMB}MB). Try a shorter video.`);
+          throw new TooLargeError(`❌ This quality is over ${config.maxFileSizeMB}MB — trying a lower quality…`);
         }
         if (!file.write(chunk)) await new Promise<void>((r) => file.once("drain", r));
         if (total > 0 && onProgress) onProgress({ percent: (received / total) * 100 });
@@ -109,13 +119,13 @@ async function streamToFile(
     return received;
   } catch (err: any) {
     try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch {}
+    if (err instanceof TooLargeError) throw err;
     if (err?.name === "AbortError") throw new Error("❌ Download timed out. Please try again.");
     throw err instanceof Error ? err : new Error(`❌ Download failed: ${err}`);
   } finally {
     clearTimeout(timeout);
   }
 }
-
 /**
  * Live backend discovery: the official Piped docs repo lists every known
  * public instance. Public backends die regularly (verified Sep 2026: 10 of
@@ -203,7 +213,7 @@ async function tryPipedInstance(
   onProgress?: (p: DownloadProgress) => void
 ): Promise<DownloadResult> {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 15000);
+  const timeout = setTimeout(() => controller.abort(), config.publicApiTimeoutMs);
   try {
     const res = await fetch(`${instance}/streams/${videoId}`, {
       headers: { "User-Agent": UA, Accept: "application/json" },
@@ -213,29 +223,43 @@ async function tryPipedInstance(
     const data = (await res.json()) as PipedResponse;
     if (data?.error) throw new Error(String(data.error).slice(0, 160));
     const streams = Array.isArray(data?.videoStreams) ? data.videoStreams! : [];
-    const chosen = pickPipedStream(streams, config.youtubeMaxHeight);
-    if (!chosen?.url) {
+    const ranked = pickPipedStreamsSorted(streams, config.youtubeMaxHeight);
+    if (ranked.length === 0 || !ranked[0]?.url) {
       throw new Error("no progressive mp4 stream (login-walled or gone?)");
     }
-    const height = parseHeight(chosen);
-    console.log(
-      `⚡ Piped ${instance}: "${(data.title || videoId).slice(0, 60)}" ` +
-        `-> ${chosen.quality || (height ? height + "p" : "mp4")} progressive MP4`
-    );
 
     const id = crypto.randomBytes(6).toString("hex");
-    const fileName = `${id}_${sanitizeFileName(data.title || videoId)}.mp4`;
-    const filePath = path.join(config.downloadDir, fileName);
     if (!fs.existsSync(config.downloadDir)) fs.mkdirSync(config.downloadDir, { recursive: true });
 
-    await streamToFile(chosen.url, filePath, onProgress);
-    const stat = fs.statSync(filePath);
-    if (stat.size === 0) {
-      try { fs.unlinkSync(filePath); } catch {}
-      throw new Error("empty file");
+    // Walk renditions best-first: an over-limit file retries the next lower
+    // quality on the SAME backend instead of failing the whole video.
+    for (const chosen of ranked) {
+      const height = parseHeight(chosen);
+      const fileName = `${id}_${sanitizeFileName(data.title || videoId)}.mp4`;
+      const filePath = path.join(config.downloadDir, fileName);
+      try {
+        console.log(
+          `⚡ Piped ${instance}: "${(data.title || videoId).slice(0, 60)}" ` +
+            `-> ${chosen.quality || (height ? height + "p" : "mp4")} progressive MP4`
+        );
+        await streamToFile(chosen.url!, filePath, onProgress);
+      } catch (err: any) {
+        if (err instanceof TooLargeError) {
+          console.log(`⚡ Piped ${instance}: ${height || "?"}p over limit, trying lower quality…`);
+          continue;
+        }
+        throw err;
+      }
+      const stat = fs.statSync(filePath);
+      if (stat.size === 0) {
+        try { fs.unlinkSync(filePath); } catch {}
+        throw new Error("empty file");
+      }
+      console.log(`✅ Piped saved: ${fileName} (${(stat.size / 1048576).toFixed(1)} MB)`);
+      return { filePath, fileName, title: data.title, ext: "mp4", size: stat.size, platform: "youtube" };
     }
-    console.log(`✅ Piped saved: ${fileName} (${(stat.size / 1048576).toFixed(1)} MB)`);
-    return { filePath, fileName, title: data.title, ext: "mp4", size: stat.size, platform: "youtube" };
+    // Every rendition overflowed the Telegram limit — definitive for this video.
+    throw new Error(`❌ Video too large (>${config.maxFileSizeMB}MB even at the lowest quality). Try a shorter video.`);
   } finally {
     clearTimeout(timeout);
   }
@@ -267,7 +291,11 @@ export async function downloadYouTubeViaPiped(
   const videoId = extractYouTubeId(url);
   if (!videoId) return null;
 
-  const instances = await resolvePipedInstances();
+  const allInstances = await resolvePipedInstances();
+  // Cap the rotation: public backends die constantly and each dead host
+  // costs a full timeout. First 12 (verified-alive first) is plenty —
+  // beyond that we burn minutes for almost zero extra hit rate.
+  const instances = allInstances.slice(0, 12);
   const summary: PipedSummary = { tried: 0, botWalled: 0, notFound: 0, unreachable: 0, other: 0 };
   const failures: string[] = [];
   const answered: string[] = []; // backends that returned HTTP (worth a retry)
@@ -277,6 +305,7 @@ export async function downloadYouTubeViaPiped(
     try {
       return await tryPipedInstance(instance, videoId, onProgress);
     } catch (err: any) {
+      if (err instanceof TooLargeError) throw err; // handled per-rendition; all overflowed → definitive
       const msg = err?.message || String(err);
       if (msg.startsWith("❌")) throw err; // definitive (too large) — stop everything
       const kind = classifyPipedError(msg);
@@ -300,13 +329,13 @@ export async function downloadYouTubeViaPiped(
   }
 
   // Pass 2: transient bot-walls often clear within seconds — retry the
-  // backends that answered (skip DNS-dead ones), once.
+  // backends that answered (skip DNS-dead ones), once, after a short pause.
   const transient = summary.botWalled + summary.other;
   if (transient > 0 && summary.notFound === 0) {
-    const retryList = [...new Set(answered)];
+    const retryList = [...new Set(answered)].slice(0, 4);
     if (retryList.length > 0) {
-      console.log(`⚡ Piped: ${transient} transient failure(s), retrying ${retryList.length} answering backend(s) in 5s…`);
-      await new Promise((r) => setTimeout(r, 5000));
+      console.log(`⚡ Piped: ${transient} transient failure(s), retrying ${retryList.length} answering backend(s) in 3s…`);
+      await new Promise((r) => setTimeout(r, 3000));
       for (const instance of retryList) {
         const hit = await attempt(instance);
         if (hit) {

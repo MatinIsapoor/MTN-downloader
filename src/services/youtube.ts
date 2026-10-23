@@ -14,12 +14,16 @@ import type { DownloadProgress, DownloadResult } from "./downloader";
  *      deciphering, cookies, impersonation, proxy) — first by default
  *      (YOUTUBE_YTDLP_FIRST=false restores cookie-free-first order)
  *   2. Cobalt API (only when self-hosted COBALT_API_URL is configured)
- *   3. Piped API (public path — verified working backends first, plus live
+ *   3. youtubei multi-client (cheap plain-HTTPS resort on our own IP —
+ *      ANDROID → IOS → MWEB → WEB → TV, zero third parties)
+ *   4. Piped API (public path — verified working backends first, plus live
  *      discovery from the official instance list so it self-heals)
- *   4. Invidious (legacy fallback — most public instances disabled their API)
- *   5. youtubei multi-client (last plain-HTTPS resort — ANDROID → IOS →
- *      MWEB → WEB → TV rotations from our own IP, zero third parties)
+ *   5. Invidious (legacy fallback — most public instances disabled their API)
  *
+ * Rationale (2026): public Piped/Invidious instances are mostly dead or
+ * API-disabled, and each dead host costs a full request timeout. They stay
+ * as last-resort fallbacks, but youtubei (5 quick HTTPS POSTs, no third
+ * party) is tried first so the average walled-video path is minutes faster.
  * Piped/Invidious run on THEIR OWN server IPs (our datacenter IP's bot-wall
  * doesn't apply to them); youtubei + yt-dlp use OUR IP but with different
  * techniques/clients. YouTube walls per (video, IP[, client]), so each
@@ -61,7 +65,23 @@ export async function downloadYouTubeCookieFree(
     }
   }
 
-  // --- 3) Piped (public path) ---------------------------------------------
+  // --- 3) youtubei multi-client (cheap HTTPS resort on our own IP) ------
+  // Tried BEFORE the public Piped/Invidious networks: 5 quick POSTs with no
+  // third party, so it either wins fast or fails fast. Tracks whether OUR
+  // OWN IP was also walled, for the final error message.
+  let androidWalled = false;
+  try {
+    console.log("⚡ YouTube: trying youtubei clients…");
+    const fast = await downloadYouTubeViaAndroid(url, onProgress);
+    if (fast) return fast;
+  } catch (err: any) {
+    if (err?.message?.startsWith("❌")) throw err;
+    const msg = err?.message || String(err);
+    console.warn(`⚠️ YouTube youtubei clients failed: ${msg.slice(0, 150)}`);
+    if (/LOGIN_REQUIRED|not a bot|confirm you|429|Too Many|ERROR/i.test(msg)) androidWalled = true;
+  }
+
+  // --- 4) Piped (public path, mostly dead in 2026 — last resorts) ---------
   if (config.pipedEnabled) {
     try {
       console.log("⚡ YouTube: trying Piped…");
@@ -74,7 +94,7 @@ export async function downloadYouTubeCookieFree(
     }
   }
 
-  // --- 4) Invidious (legacy fallback) -------------------------------------
+  // --- 5) Invidious (legacy fallback) -------------------------------------
   if (config.invidiousEnabled) {
     try {
       console.log("⚡ YouTube: trying Invidious…");
@@ -84,20 +104,6 @@ export async function downloadYouTubeCookieFree(
       if (err?.message?.startsWith("❌")) throw err;
       console.warn(`⚠️ YouTube Invidious failed: ${(err?.message || String(err)).slice(0, 150)}`);
     }
-  }
-
-  // --- 5) youtubei multi-client (last plain-HTTPS resort, our own IP) ------
-  // Tracks whether OUR OWN IP was also walled, for the final error message.
-  let androidWalled = false;
-  try {
-    console.log("⚡ YouTube: trying youtubei clients…");
-    const fast = await downloadYouTubeViaAndroid(url, onProgress);
-    if (fast) return fast;
-  } catch (err: any) {
-    if (err?.message?.startsWith("❌")) throw err;
-    const msg = err?.message || String(err);
-    console.warn(`⚠️ YouTube youtubei clients failed: ${msg.slice(0, 150)}`);
-    if (/LOGIN_REQUIRED|not a bot|confirm you/i.test(msg)) androidWalled = true;
   }
 
   // --- yt-dlp LAST (only when not already tried first) ----------------------
@@ -129,7 +135,7 @@ async function tryYtDlp(
     if (err?.message?.startsWith("❌")) throw err;
     const msg = err?.message || String(err);
     console.warn(`⚠️ YouTube yt-dlp failed: ${msg.slice(0, 150)}`);
-    const walled = /not a bot|LOGIN_REQUIRED|confirm you|player response|use --cookies/i.test(msg)
+    const walled = /not a bot|LOGIN_REQUIRED|confirm you|player response|use --cookies|HTTP 429|Too Many Requests|timed out/i.test(msg)
       || getLastYtDlpSummary().walled > 0;
     return { result: null, walled };
   }
@@ -171,17 +177,22 @@ function buildYouTubeError(androidWalled = false, ytdlpWalled = false): Error {
     const cookieHint = hasUsableCookies()
       ? ""
       : "\n\n🔑 Note: this bot has NO login cookies installed, so age-restricted or rate-limited videos can't work — the admin can send a fresh logged-in cookies.txt to the bot (applies instantly).";
+    // Datacenter IPs get the strictest checks; name the actual fix.
+    const proxyHint = config.ytDlpProxy
+      ? ""
+      : "\n\n🌐 If this happens for EVERY video (not just this one), the server IP itself is rate-limited — a residential proxy (YT_DLP_PROXY) is the only fix.";
     return new Error(
       `❌ YouTube bot-blocked this video ${where} right now (its anti-bot wall is per-video and temporary).\n\n` +
         "Please try again in a few minutes — a different server usually answers on retry — " +
         "or try a different public video.\n\n" +
         "🔧 Admin: for reliable downloads, self-host Cobalt (ghcr.io/imputnet/cobalt) and set COBALT_API_URL." +
         ytdlpHint +
-        cookieHint
+        cookieHint +
+        proxyHint
     );
   }
   return new Error(
-    "❌ YouTube download failed on every method (yt-dlp, Cobalt, Piped, Invidious, youtubei).\n\n" +
+    "❌ YouTube download failed on every method (yt-dlp, Cobalt, youtubei, Piped, Invidious).\n\n" +
       "Please try again in a few minutes or try a different public video — " +
       "age-restricted/private videos are hidden from anonymous services and can't be downloaded.\n\n" +
       "🔧 Admin: check the Render logs for the per-method errors " +

@@ -1,6 +1,8 @@
 import { Telegraf, Context } from "telegraf";
 import { message } from "telegraf/filters";
-import { downloadVideo, extractAudio, cleanupFile } from "../../services/downloader";
+import { downloadVideo, extractAudio, cleanupFile, tryAcquireDownloadSlot, releaseDownloadSlot } from "../../services/downloader";
+import { withTimeout } from "../../services/quality";
+import { config } from "../../config";
 import { extractUrls, isSupportedUrl, detectPlatform, platformEmoji, formatBytes } from "../../utils/platform";
 import { recordDownload, getDownloadsByUser, getUserByTelegramId } from "../../database";
 import { Input } from "telegraf";
@@ -123,6 +125,12 @@ export function registerUserHandlers(bot: Telegraf<Context>): void {
       await ctx.reply("⏳ You already have a download in progress. Please wait...");
       return;
     }
+    // Global cap: too many parallel yt-dlp/ffmpeg children OOM a free-tier
+    // host. Refuse politely instead of crashing everyone's download.
+    if (!tryAcquireDownloadSlot()) {
+      await ctx.reply("🚦 The bot is busy with other downloads right now (small server). Please try again in a minute...");
+      return;
+    }
     processing.add(userId);
 
     const platform = detectPlatform(url);
@@ -136,21 +144,25 @@ export function registerUserHandlers(bot: Telegraf<Context>): void {
 
       // Optional: edit message on progress (throttled)
       let lastEdit = 0;
-      const result = await downloadVideo(url, (p) => {
-        const now = Date.now();
-        if (now - lastEdit < 2000) return;
-        lastEdit = now;
-        if (p.percent) {
-          ctx.telegram
-            .editMessageText(
-              ctx.chat.id,
-              statusMsg.message_id,
-              undefined,
-              `${platformEmoji(platform)} Downloading… ${p.percent.toFixed(1)}%`
-            )
-            .catch(() => {});
-        }
-      });
+      const result = await withTimeout(
+        downloadVideo(url, (p) => {
+          const now = Date.now();
+          if (now - lastEdit < 2000) return;
+          lastEdit = now;
+          if (p.percent) {
+            ctx.telegram
+              .editMessageText(
+                ctx.chat.id,
+                statusMsg.message_id,
+                undefined,
+                `${platformEmoji(platform)} Downloading… ${p.percent.toFixed(1)}%`
+              )
+              .catch(() => {});
+          }
+        }),
+        config.downloadTimeoutMs,
+        "Download"
+      );
       tempFiles.push(result.filePath);
 
       // Check file size vs Telegram limit (50MB for bots via sendVideo, but 2000MB with local API)
@@ -227,6 +239,7 @@ export function registerUserHandlers(bot: Telegraf<Context>): void {
     } finally {
       for (const f of tempFiles) cleanupFile(f);
       processing.delete(userId);
+      releaseDownloadSlot();
     }
   });
 }

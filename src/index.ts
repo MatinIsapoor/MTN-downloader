@@ -11,7 +11,7 @@ import {
   setFindWaiting,
   handleFindText,
 } from "./bot/handlers/admin";
-import { cleanupOldFiles, logDownloaderDiagnostics, ensureCookiesFromEnv, maybeAutoUpdateYtDlp } from "./services/downloader";
+import { cleanupOldFiles, logDownloaderDiagnostics, ensureCookiesFromEnv, maybeAutoUpdateYtDlp, enforceDiskBudget } from "./services/downloader";
 import {
   handleHealthRequest,
   resolveKeepaliveConfig,
@@ -89,11 +89,16 @@ async function main() {
   // Cleanup old downloads every hour
   setInterval(() => {
     cleanupOldFiles(2);
+    enforceDiskBudget();
     console.log("🧹 Cleaned up old download files");
   }, 60 * 60 * 1000);
 
-  // Start bot
-    // Start bot with Webhook (for Render) or Polling (for local)
+  // Remove leftovers from a previous run (crash/redeploy orphans) so the
+  // disk doesn't fill up over time on hosts with small ephemeral disks.
+  cleanupOldFiles(2);
+  enforceDiskBudget();
+
+  // Start bot with Webhook (for Render) or Polling (for local)
   const PORT = parseInt(process.env.PORT || '3000', 10);
   const isRender = !!process.env.RENDER_EXTERNAL_URL;
 

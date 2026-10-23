@@ -179,6 +179,23 @@ export const config = {
   // build already installs nightly; enable with YTDLP_AUTO_UPDATE=true to
   // heal stale deploys without a manual redeploy).
   ytdlpAutoUpdate: (process.env.YTDLP_AUTO_UPDATE || "false").toLowerCase() === "true",
+  // --- Stability (free-tier hosting) ---------------------------------------
+  // Overall per-download time budget (ms). The YouTube pipeline fans out over
+  // many backends/clients; without a cap a walled video can keep the user
+  // waiting 10+ min. Default 5 min — after that the user gets a clear
+  // "timed out, retry" message instead of a hang.
+  downloadTimeoutMs: Math.max(60000, Number(process.env.DOWNLOAD_TIMEOUT_MS || 300000) || 300000),
+  // Max simultaneous downloads across ALL users. Render free has ~512MB RAM;
+  // each yt-dlp/ffmpeg child costs memory, so queue (politely refuse) instead
+  // of running everything in parallel. Personal use: 2-3 is plenty.
+  maxConcurrentDownloads: Math.max(1, Number(process.env.MAX_CONCURRENT_DOWNLOADS || 2) || 2),
+  // Per-attempt timeout for one yt-dlp process (ms). yt-dlp has no internal
+  // global timeout — a stuck client would otherwise hang the bot forever.
+  ytDlpAttemptTimeoutMs: Math.max(30000, Number(process.env.YT_DLP_ATTEMPT_TIMEOUT_MS || 150000) || 150000),
+  // Per-request timeout for public YouTube APIs (Piped/Invidious/youtubei).
+  // Public backends die constantly; failing fast (10s) keeps the rotation
+  // moving instead of stalling 15-20s on each dead host.
+  publicApiTimeoutMs: Math.max(5000, Number(process.env.PUBLIC_API_TIMEOUT_MS || 10000) || 10000),
 };
 
 export function isAdmin(userId: number): boolean {
