@@ -156,7 +156,6 @@ export function registerUserHandlers(bot: Telegraf<Context>): void {
 
       // Optional: edit message on progress (throttled)
       let lastEdit = 0;
-      let consumed = false;
       const downloadPromise = downloadVideo(url, (p) => {
         const now = Date.now();
         if (now - lastEdit < 2000) return;
@@ -172,16 +171,26 @@ export function registerUserHandlers(bot: Telegraf<Context>): void {
             .catch(() => {});
         }
       });
-      downloadPromise
-        .then((r) => {
-          // Nobody is waiting for it any more (timeout already reported).
-          if (!consumed) cleanupFile(r.filePath);
-        })
-        .catch(() => {})
-        .finally(releaseSlot);
+      // The slot follows the actual download, and a late rejection must never
+      // surface as an unhandled rejection.
+      downloadPromise.finally(releaseSlot).catch(() => {});
 
-      const result = await withTimeout(downloadPromise, config.downloadTimeoutMs, "Download");
-      consumed = true;
+      let result;
+      try {
+        result = await withTimeout(downloadPromise, config.downloadTimeoutMs, "Download");
+      } catch (err) {
+        // We are no longer interested in the outcome (timeout, or the download
+        // itself failed). If it STILL finishes later, delete the orphan file.
+        //
+        // BUGFIX: this cleanup used to be registered on the success path too
+        // (`downloadPromise.then(r => { if (!consumed) cleanupFile(...) })`).
+        // Promise reactions run in registration order, so that handler ran
+        // BEFORE the `await` continuation — `consumed` was still false and the
+        // freshly downloaded file was deleted on EVERY successful download,
+        // making the upload fail with ENOENT ("bot downloads nothing").
+        downloadPromise.then((r) => cleanupFile(r.filePath)).catch(() => {});
+        throw err;
+      }
       tempFiles.push(result.filePath);
 
       // Telegram's cloud Bot API rejects files above 50MB, so a download that
