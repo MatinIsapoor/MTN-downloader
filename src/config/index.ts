@@ -11,6 +11,8 @@ function requireEnv(name: string): string {
 
 export const config = {
   botToken: requireEnv("BOT_TOKEN"),
+  // Optional YouTube player API key; configure as YOUTUBE_API_KEY in the host environment.
+  youtubeApiKey: (process.env.YOUTUBE_API_KEY || "").trim(),
   adminIds: (process.env.ADMIN_IDS || "")
     .split(",")
     .map((s) => s.trim())
