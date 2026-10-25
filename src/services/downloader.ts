@@ -503,6 +503,16 @@ export function logDownloaderDiagnostics(): void {
       ? `🔧 ffmpeg: available (${getFfmpegVersion()}, H.264 encoder: ${hasLibx264() ? "libx264" : "mpeg4-fallback"})`
       : "⚠️ ffmpeg: NOT FOUND — HLS-only Pinterest videos will fall back to cover images and Pinterest MP4s ship un-normalized (build.sh installs a static build on Linux)"
   );
+  // Pinterest needs the re-encode: raw pin MP4s show BLACK VIDEO + working
+  // audio in Telegram. Say explicitly which path will be used, because a silent
+  // skip here looks exactly like a broken bot to the user.
+  console.log(
+    !config.pinterestNormalize
+      ? "⚠️ Pinterest normalize: OFF (PINTEREST_NORMALIZE=false) — pin videos may arrive with black video and only audio"
+      : getFfmpegVersion()
+        ? `🔧 Pinterest normalize: ON (x264 preset ${config.pinterestX264Preset}) — fixes black-video pins`
+        : "⚠️ Pinterest normalize: ON but ffmpeg is MISSING — pin videos will arrive black (install ffmpeg / redeploy)"
+  );
   if (config.ytDlpProxy) console.log("🔧 Proxy: YT_DLP_PROXY is set (YouTube traffic routed via proxy)");
   else if (process.env.RENDER_EXTERNAL_URL || process.env.RENDER)
     console.log("🔧 Proxy: none (datacenter IP — if YouTube hard-blocks it, set YT_DLP_PROXY to a residential proxy)");

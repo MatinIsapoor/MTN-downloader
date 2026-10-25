@@ -219,7 +219,8 @@ The defaults are tuned for Render's free instance (512MB RAM, 0.1 CPU, ephemeral
 
 - **The filesystem is ephemeral and free plans cannot attach a persistent disk.** `data/bot.db` (users, stats, history) is wiped on every restart/redeploy and `cookies.txt` is restored from `COOKIES_CONTENT` only if that env var is set. Per-download media files under `downloads/` are deleted after each send anyway.
 - **Uploads are capped at 50MB** by Telegram's cloud Bot API. Keep `MAX_FILE_SIZE_MB` ≤ 50 (the bot now refuses larger files with a clear message instead of failing at upload).
-- **0.1 CPU is not enough for ffmpeg re-encoding.** `PINTEREST_NORMALIZE=false` is set in `render.yaml`: Pinterest MP4s are sent as-is (fixes timeouts, but some players may show black video + audio on those pins). Set it to `true` on a paid plan.
+- **0.1 CPU makes the Pinterest re-encode the slowest step.** `PINTEREST_NORMALIZE` stays **ON** — it is required: raw Pinterest MP4s play as **black video + audio** in Telegram. `PINTEREST_X264_PRESET=superfast` keeps the encode short and `DOWNLOAD_TIMEOUT_MS=600000` leaves room for it. Only disable normalization if you prefer fast-but-black pin videos.
+- **ffmpeg must exist on the host** for that re-encode (and for HLS merges). `build.sh` installs a static build from two sources; run `/diag` in the bot to confirm `ffmpeg: ✅` on the deployed instance.
 - **The instance spins down after ~15 min of inactivity**, so `KEEPALIVE_*`/the `/health` endpoint and an external pinger (UptimeRobot/cron-job.org, every 5 min) are what keep it awake.
 - Downloads are queued, not parallel (`MAX_CONCURRENT_DOWNLOADS=2` default): each yt-dlp/ffmpeg child is expensive on 512MB.
 

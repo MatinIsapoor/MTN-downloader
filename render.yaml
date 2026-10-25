@@ -2,8 +2,13 @@ services:
   - type: web
     name: telegram-downloader-bot
     runtime: node
-    buildCommand: ./build.sh
-    startCommand: npm start
+    # `bash build.sh` (not `./build.sh`): the script is committed without the
+    # executable bit (Windows checkout), so `./build.sh` fails with
+    # "Permission denied" on Render.
+    buildCommand: bash build.sh
+    # Direct node start (same as `npm start`): SIGTERM from Render reaches the
+    # process itself instead of going through an npm wrapper.
+    startCommand: node dist/index.js
     healthCheckPath: /health
     envVars:
       - key: BOT_TOKEN
@@ -41,20 +46,25 @@ services:
       # Self-ping interval (min). Stays under Render's ~15 min idle spin-down.
       - key: KEEPALIVE_INTERVAL_MINUTES
         value: "10"
-      # Pinterest MP4 normalization is a FULL ffmpeg re-encode (fixes black
-      # video in Telegram's mobile player). On the free plan (0.1 CPU) a
-      # one-minute clip takes minutes of CPU and eats the download budget, so
-      # it is disabled here: the original Pinterest MP4 is sent as-is. Set to
-      # "true" on a paid plan or if Pinterest videos show black frames.
+      # Pinterest MP4 normalization: a FULL ffmpeg re-encode. This is REQUIRED
+      # for Pinterest videos — the raw MP4s carry an edit list / HEVC framing
+      # that Telegram's player renders as BLACK VIDEO with working audio. Keep
+      # it ON (only disable to trade picture for speed on a very slow host).
       - key: PINTEREST_NORMALIZE
-        value: "false"
+        value: "true"
+      # x264 preset for that re-encode: "superfast" keeps the encode short on a
+      # 0.1-CPU free instance (raise to "veryfast"/"medium" on a paid plan).
+      - key: PINTEREST_X264_PRESET
+        value: "superfast"
       # Stability on the free plan (all optional — defaults are safe):
       # max simultaneous downloads (each spawns yt-dlp/ffmpeg children).
       # - key: MAX_CONCURRENT_DOWNLOADS
       #   value: 2
-      # Overall per-download time budget (ms) before the user gets a retry message.
-      # - key: DOWNLOAD_TIMEOUT_MS
-      #   value: 300000
+      # Overall per-download time budget (ms) before the user gets a retry
+      # message. Raised because the Pinterest ffmpeg re-encode now runs inside
+      # this budget on a 0.1-CPU instance.
+      - key: DOWNLOAD_TIMEOUT_MS
+        value: "600000"
       # Per yt-dlp attempt timeout (ms) / public-API request timeout (ms).
       # - key: YT_DLP_ATTEMPT_TIMEOUT_MS
       #   value: 150000

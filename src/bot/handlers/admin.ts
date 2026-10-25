@@ -10,7 +10,15 @@ import {
   unbanUser,
   getUserCount,
 } from "../../database";
-import { getCookiesStatus, saveCookiesContent } from "../../services/downloader";
+import {
+  getCookiesStatus,
+  saveCookiesContent,
+  getYtDlpVersion,
+  ytDlpAgeDays,
+  getActiveDownloadCount,
+} from "../../services/downloader";
+import { getFfmpegBinary, getFfmpegVersion, hasLibx264 } from "../../services/media";
+import { isCobaltConfigured } from "../../services/cobalt";
 import { config } from "../../config";
 import { escapeHtml } from "../../utils/escape";
 
@@ -257,6 +265,47 @@ export function registerAdminHandlers(bot: Telegraf<Context>): void {
   bot.command("cookies", async (ctx) => {
     if (!adminOnly(ctx)) return;
     await ctx.reply(cookiesStatusText(), { parse_mode: "HTML" });
+  });
+
+  // ── Runtime diagnostics: answers "why is this download failing / black?" ──
+  // Everything here is read from the RUNNING process, so it shows what the
+  // deployed bot actually sees (ffmpeg present? which preset? which limits?).
+  bot.command("diag", async (ctx) => {
+    if (!adminOnly(ctx)) return;
+    const ffmpegVersion = getFfmpegVersion();
+    const ytdlpVersion = getYtDlpVersion();
+    const ytdlpAge = ytDlpAgeDays();
+    const mem = process.memoryUsage();
+    const cookies = getCookiesStatus();
+    const uploadLimit =
+      config.telegramUploadLimitMB === 0 ? "unlimited" : `${config.telegramUploadLimitMB} MB`;
+    const lines = [
+      "🩺 <b>Runtime diagnostics</b>",
+      "",
+      `Node <code>${escapeHtml(process.version)}</code> · ${escapeHtml(process.platform)}/${escapeHtml(process.arch)} · uptime <b>${Math.floor(process.uptime() / 60)}</b> min`,
+      `Memory: RSS <b>${(mem.rss / 1048576).toFixed(0)}</b> MB · heap <b>${(mem.heapUsed / 1048576).toFixed(0)}</b> MB`,
+      `CWD: <code>${escapeHtml(process.cwd())}</code>`,
+      `Mode: ${process.env.RENDER_EXTERNAL_URL ? "✅ Render webhook" : "local / polling"}`,
+      "",
+      "<b>ffmpeg</b> — required for the Pinterest black-video fix and HLS merges",
+      `status: ${ffmpegVersion ? `✅ <code>${escapeHtml(ffmpegVersion)}</code>` : "❌ <b>NOT FOUND</b>"}`,
+      `binary: <code>${escapeHtml(getFfmpegBinary())}</code>`,
+      `H.264 encoder: ${ffmpegVersion ? (hasLibx264() ? "libx264 ✅" : "only mpeg4 ⚠️") : "n/a"}`,
+      `Pinterest normalize: ${config.pinterestNormalize ? "✅ ON" : "⚠️ OFF (black video risk)"} · preset <code>${escapeHtml(config.pinterestX264Preset)}</code>`,
+      "",
+      "<b>yt-dlp</b>",
+      `status: ${ytdlpVersion ? `✅ <code>${escapeHtml(ytdlpVersion)}</code>${ytdlpAge !== null ? ` (${ytdlpAge}d old)` : ""}` : "❌ <b>NOT FOUND</b>"}`,
+      `path: <code>${escapeHtml(config.ytDlpPath)}</code>`,
+      `Cobalt: ${isCobaltConfigured() ? "✅ configured" : "— not configured (optional)"}`,
+      "",
+      "<b>Limits</b>",
+      `active downloads: <b>${getActiveDownloadCount()}</b> / ${config.maxConcurrentDownloads}`,
+      `size cap: <b>${config.maxFileSizeMB}</b> MB · upload limit: <b>${uploadLimit}</b>`,
+      `timeouts: overall ${Math.round(config.downloadTimeoutMs / 1000)}s · yt-dlp ${Math.round(config.ytDlpAttemptTimeoutMs / 1000)}s`,
+      "",
+      `Cookies: ${escapeHtml(cookies.detail)}`,
+    ];
+    await ctx.reply(lines.join("\n"), { parse_mode: "HTML" });
   });
 
   // ── Cookies refresh via file upload ──

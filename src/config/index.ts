@@ -60,6 +60,10 @@ export const config = {
   // it can be disabled there: the original file is sent instead (plays fine on
   // most players, may show black video + audio on strict ones).
   pinterestNormalize: (process.env.PINTEREST_NORMALIZE || "true").toLowerCase() !== "false",
+  // x264 preset for that re-encode. "veryfast" is the quality/speed default; a
+  // 0.1-CPU free tier encodes markedly faster with "superfast" at a small
+  // quality cost (the clip is re-encoded at CRF 23 anyway, so it stays fine).
+  pinterestX264Preset: (process.env.PINTEREST_X264_PRESET || "veryfast").trim() || "veryfast",
   // YouTube without cookies: "auto" (default) tries anonymous player clients
   // (android/mweb/web_safari/web_embedded, no login) FIRST and only uses cookies as a
   // fallback for age-gated/private/rate-limited videos. Most public videos

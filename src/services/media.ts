@@ -171,17 +171,26 @@ function runFfmpeg(args: string[], timeoutMs: number): Promise<void> {
  */
 export async function normalizePinterestMp4(result: DownloadResult): Promise<DownloadResult> {
   // Free-tier hosts (Render 0.1 CPU) can spend minutes on a single re-encode;
-  // PINTEREST_NORMALIZE=false sends the original MP4 untouched instead.
+  // PINTEREST_NORMALIZE=false sends the original MP4 untouched instead — but
+  // the raw Pinterest MP4 is exactly what shows "black video + working audio"
+  // in Telegram's player, so this is a last-resort switch, not a speed knob.
   if (!config.pinterestNormalize) return result;
-  if (getFfmpegVersion() === null) return result;
+  if (getFfmpegVersion() === null) {
+    console.warn(
+      "⚠️ Pinterest normalize SKIPPED: ffmpeg not found — the raw Pinterest MP4 can show black video with audio on strict players (build.sh installs a static ffmpeg; check /diag on the deployed bot)."
+    );
+    return result;
+  }
   const probe = probeMedia(result.filePath);
   const inDesc = probe && probe.hasVideo
     ? `${probe.videoCodec || "?"}${probe.pixFmt ? `/${probe.pixFmt}` : ""}${probe.hasAudio ? `+${probe.audioCodec || "?"}` : ""}`
     : "unprobed";
   const fixedPath = result.filePath.replace(/\.mp4$/i, "") + "_norm.mp4";
   const durationSec = probe && probe.durationSec > 0 ? probe.durationSec : 60;
-  // Generous but bounded: ~15s of CPU per second of video, 2–10 min window.
-  const timeoutMs = Math.min(600000, Math.max(120000, Math.ceil(durationSec * 15000)));
+  // Capped so the encode can never consume the whole per-download budget on its
+  // own (download + upload still need room). If it does not finish in time the
+  // original file is sent instead of the user getting a timeout.
+  const timeoutMs = Math.min(240000, Math.max(90000, Math.ceil(durationSec * 12000)));
 
   const accept = (label: string): DownloadResult | null => {
     try {
@@ -202,8 +211,11 @@ export async function normalizePinterestMp4(result: DownloadResult): Promise<Dow
   };
 
   // --- 1) Full transcode (the actual black-screen fix) ----------------------
+  // Preset is configurable: on a 0.1-CPU free tier the encode is the slowest
+  // step of a Pinterest download, and it happens INSIDE the download timeout.
+  const preset = config.pinterestX264Preset;
   const videoArgs = hasLibx264()
-    ? ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p"]
+    ? ["-c:v", "libx264", "-preset", preset, "-crf", "23", "-pix_fmt", "yuv420p"]
     : ["-c:v", "mpeg4", "-q:v", "4", "-pix_fmt", "yuv420p"];
   try {
     await runFfmpeg(
