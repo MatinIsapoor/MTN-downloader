@@ -23,8 +23,6 @@ import type { DownloadProgress, DownloadResult } from "./downloader";
  * ANDROID 19.x returns nothing at all (YouTube killed it).
  */
 
-const KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
-
 interface YoutubeiClient {
   name: string;
   userAgent: string;
@@ -274,7 +272,7 @@ export async function downloadYouTubeViaAndroid(
   onProgress?: (p: DownloadProgress) => void
 ): Promise<DownloadResult | null> {
   const videoId = extractYouTubeId(url);
-  if (!videoId) return null;
+  if (!videoId || !config.youtubeApiKey) return null;
 
   const failures: string[] = [];
   for (const client of YOUTUBEI_CLIENTS) {
@@ -287,7 +285,7 @@ export async function downloadYouTubeViaAndroid(
         "Content-Type": "application/json",
       };
       if (client.origin) headers.Origin = client.origin;
-      const res = await fetch(`https://www.youtube.com/youtubei/v1/player?key=${KEY}&prettyPrint=false`, {
+      const res = await fetch(`https://www.youtube.com/youtubei/v1/player?key=${encodeURIComponent(config.youtubeApiKey)}&prettyPrint=false`, {
         method: "POST",
         headers,
         body: JSON.stringify({
