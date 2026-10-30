@@ -12,11 +12,7 @@ import {
   handleFindText,
 } from "./bot/handlers/admin";
 import { cleanupOldFiles, logDownloaderDiagnostics, ensureCookiesFromEnv, maybeAutoUpdateYtDlp, enforceDiskBudget } from "./services/downloader";
-import {
-  handleHealthRequest,
-  resolveKeepaliveConfig,
-  startSelfPing,
-} from "./services/keepalive";
+import { handleHealthRequest } from "./services/keepalive";
 
 async function main() {
   console.log("🚀 Starting Telegram Downloader Bot...");
@@ -139,16 +135,6 @@ async function main() {
     console.log(`🚀 ربات روی پورت ${PORT} در حال اجراست!`);
     console.log(`🏓 Health check: ${domain}/health`);
 
-    // Self-ping generates inbound traffic every ~10 min, resetting Render's
-    // ~15 min idle spin-down timer while the instance is awake. It cannot wake
-    // an already-sleeping instance, so also add a free external pinger
-    // (UptimeRobot / cron-job.org every 5 min -> <domain>/health).
-    const keepalive = resolveKeepaliveConfig();
-    if (keepalive.enabled) {
-      startSelfPing(keepalive.publicUrl, keepalive.intervalMs);
-    } else {
-      console.log("⏰ Keep-alive self-ping disabled (set KEEPALIVE_URL or RENDER_EXTERNAL_URL to enable)");
-    }
   } else {
     // در محیط محلی (کامپیوتر خودتان): از Polling استفاده کن
     await bot.launch();
